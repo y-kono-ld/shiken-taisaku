@@ -1,5 +1,5 @@
 // オフライン対応：まずネットから取得し、つながらない時はキャッシュを使う
-const CACHE = 'shiken-v2026.09.15g';
+const CACHE = 'shiken-v2026.09.15h';
 const FILES = ['./', 'index.html', 'css/style.css', 'js/keisu.js', 'js/app.js', 'data/kiso.json', 'data/yogo.json', 'manifest.webmanifest', 'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {

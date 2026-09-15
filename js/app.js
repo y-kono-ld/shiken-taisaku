@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '2026.09.15g';
+  const APP_VERSION = '2026.09.15h';
   const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss', missKiso: 'shiken.v1.kisoMiss', missKeisu: 'shiken.v1.keisuMiss' };
   // 練習1回の出題数と目安時間（分/問）
   const DRILL_COUNTS = { kiso: [10, 20, 30], yogo: [10, 20, 30], keisu: [5, 10, 15] };
@@ -114,9 +114,29 @@
     const li = lines.findIndex((l) => l.includes(`{{${bi}}}`));
     // 出題する空欄だけ {{0}}、同じ行のほかの空欄は答えを〔〕で埋めて文として読めるようにする
     const fill = (l, target) => l.replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === target ? '{{0}}' : `〔${s.blanks[Number(n)].answer}〕`)).trim();
-    let ctx = '';
-    for (let j = li - 1; j >= 0; j--) { if (/^\s*[○〈ⅠⅡⅢⅣⅤ]/.test(lines[j])) { ctx = fill(lines[j], null); break; } }
-    return { kind: 'kiso', id: `${s.id}-${bi}`, title: s.title, text: (ctx ? ctx + '\n' : '') + fill(lines[li], bi), blanks: [{ answer: s.blanks[bi].answer, choices: shuffle(s.blanks[bi].choices) }] };
+    const ctx = [];
+    // 大問冒頭の説明文（空欄を含まない行）は問題の意図なので必ず出す。見出しそのものの行（○経営ビジョン 等）は省く
+    const titleKey = s.title.replace(/[(（].*$/, '').trim();
+    for (let j = 0; j < li && !/\{\{\d+\}\}/.test(lines[j]); j++) {
+      const bare = lines[j].replace(/^[\s○〈]+|[〉\s]+$/g, '').replace(/とは[？?]$/, '');
+      if (bare && !titleKey.startsWith(bare) && !bare.startsWith(titleKey)) ctx.push(lines[j].trim());
+      else if (bare && bare.length > titleKey.length + 2) ctx.push(lines[j].trim()); // 見出し＋補足がある行は残す
+    }
+    // 直前の見出し行（Ⅰ．〜良い会社 など）は答えを埋めて添える
+    for (let j = li - 1; j >= 0; j--) {
+      if (/^\s*[ⅠⅡⅢⅣⅤ]/.test(lines[j])) { if (j !== li) ctx.push(fill(lines[j], null)); break; }
+      if (!/\{\{\d+\}\}/.test(lines[j])) break;
+    }
+    // 1つの文が複数行にまたがる場合（経営理念など）は、文の続きになっている前の行も答えを埋めて添える
+    const cont = [];
+    for (let j = li - 1; j >= 0 && cont.length < 3; j--) {
+      const l = lines[j].trim();
+      if (!l || /。$/.test(l) || /^[○〈ⅠⅡⅢⅣⅤ１-９0-9一①-⑳]/.test(l) || /^[（(]\d+[）)]/.test(l) || /[＝→]/.test(l)) break;
+      cont.unshift(fill(lines[j], null));
+    }
+    cont.forEach((c) => { if (!ctx.includes(c)) ctx.push(c); });
+    const target = fill(lines[li], bi).replace(/^[（(]\d+[）)]\s*/, '');
+    return { kind: 'kiso', id: `${s.id}-${bi}`, title: s.title, text: ctx.concat([target]).join('\n'), blanks: [{ answer: s.blanks[bi].answer, choices: shuffle(s.blanks[bi].choices) }] };
   }
 
   function buildDrill(subj, type, count) {
@@ -382,7 +402,7 @@
       const text = esc(p.text)
         .replace(/[（(]?〔([^〕]*)〕[）)]?/g, '<span class="given-word">$1</span>')
         .replace('{{0}}', checked ? `<span class="blank filled ${ok ? '' : 'wrong'}">${esc(b.answer)}</span>` : '<span class="blank active">　？　</span>');
-      body = `<p class="muted" style="margin:0 0 4px">${esc(p.title)}　<b style="color:var(--ink)">「？」にあてはまる語句を選んでください</b></p>
+      body = `<div class="drill-title">${esc(p.title)}</div><p class="muted" style="margin:0 0 8px">「？」にあてはまる語句を選んでください</p>
         <div class="kiso-text" style="font-size:17px">${text}</div>
         <div class="choices" style="margin-top:12px">${b.choices.map((c) => `<button class="choice ${checked && c === b.answer ? 'right' : ''} ${checked && c === v && c !== b.answer ? 'bad' : ''}" data-act="pick" data-val="${esc(c)}" ${checked ? 'disabled' : ''}>${esc(c)}</button>`).join('')}</div>
         ${checked ? resultBox(ok, `<b>${esc(b.answer)}</b>`, answered(v) ? esc(v) : '（わからない）') : ''}`;
