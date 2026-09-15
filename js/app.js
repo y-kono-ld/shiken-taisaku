@@ -2,9 +2,11 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '2026.09.15c';
-  const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss' };
-  const DRILL_COUNTS = [10, 20, 30];
+  const APP_VERSION = '2026.09.15d';
+  const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss', missKiso: 'shiken.v1.kisoMiss', missKeisu: 'shiken.v1.keisuMiss' };
+  // 練習1回の出題数と目安時間（分/問）
+  const DRILL_COUNTS = { kiso: [10, 20, 30], yogo: [10, 20, 30], keisu: [3, 5] };
+  const DRILL_MIN = { kiso: 0.3, yogo: 0.4, keisu: 2.5 };
   const SUBJECTS = { kiso: '基礎知識', keisu: '計数', yogo: '初歩用語' };
   const EXAM_TYPES = { toyo: '登用試験', trainee: 'トレーニー試験' };
   const LIMIT_MIN = 90;
@@ -76,26 +78,61 @@
     return pages;
   }
 
-  function newExam(type, mode, subjects, drillCount) {
+  function newExam(type, mode, subjects, drillCount) { // mode: honban | drill
     const now = Date.now();
     const e = {
       id: 'e' + now.toString(36) + Math.random().toString(36).slice(2, 6), app: APP_VERSION,
       type, mode, name: (load(LS.name, '') || '').trim(), startedAt: now,
       deadline: mode === 'honban' ? now + LIMIT_MIN * 60 * 1000 : null,
-      subjects: subjects.map((k) => ({ key: k, pages: mode === 'drill' ? buildDrill(drillCount) : buildSubject(k, type) })), ans: {}, checked: {},
+      subjects: subjects.map((k) => ({ key: k, pages: mode === 'drill' ? buildDrill(k, type, drillCount) : buildSubject(k, type) })), ans: {}, checked: {},
     };
     return e;
   }
 
-  // 初歩用語の一問一答：前に間違えた語を最大半分まで優先して出す
-  function buildDrill(count) {
-    const miss = load(LS.miss, {});
-    const terms = BANK.yogo.terms;
-    const missed = shuffle(terms.filter((t) => miss[t.id] > 0)).slice(0, Math.floor(count / 2));
-    const rest = shuffle(terms.filter((t) => !missed.includes(t)));
-    return shuffle(missed.concat(rest.slice(0, count - missed.length))).map((t, i) => ({
-      kind: 'yogo', title: String(i + 1), terms: [{ id: t.id, meaning: t.meaning, hint: t.hint || '', term: t.term, accept: t.accept || [] }],
-    }));
+  // ---------- 科目別の練習（小刻み出題） ----------
+  // 前に間違えた問題を出題数の半分まで優先し、残りはランダム
+  function pickPriority(pool, idOf, missKey, count) {
+    const miss = load(missKey, {});
+    const missed = shuffle(pool.filter((x) => miss[idOf(x)] > 0)).slice(0, Math.floor(count / 2));
+    const rest = shuffle(pool.filter((x) => !missed.includes(x)));
+    const out = missed.concat(rest.slice(0, count - missed.length));
+    while (out.length < count && pool.length) out.push(pool[Math.floor(Math.random() * pool.length)]);
+    return shuffle(out);
+  }
+  function markMiss(missKey, id, good) {
+    const miss = load(missKey, {});
+    if (good) { if (miss[id]) { miss[id] -= 1; if (miss[id] <= 0) delete miss[id]; } } else { miss[id] = (miss[id] || 0) + 1; }
+    store(missKey, miss);
+  }
+  const MISS_KEY = { yogo: LS.miss, kiso: LS.missKiso, keisu: LS.missKeisu };
+
+  // 基礎知識の空欄1つを1問にする（直前の見出し行を文脈として添える）
+  function kisoOne(s, bi) {
+    const lines = s.text.split('\n');
+    const li = lines.findIndex((l) => l.includes(`{{${bi}}}`));
+    const fill = (l, target) => l.replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === target ? '{{0}}' : (target === null ? s.blanks[Number(n)].answer : '＿＿'))).trim();
+    let ctx = '';
+    for (let j = li - 1; j >= 0; j--) { if (/^\s*[○〈ⅠⅡⅢⅣⅤ]/.test(lines[j])) { ctx = fill(lines[j], null); break; } }
+    return { kind: 'kiso', id: `${s.id}-${bi}`, title: s.title, text: (ctx ? ctx + '\n' : '') + fill(lines[li], bi), blanks: [{ answer: s.blanks[bi].answer, choices: shuffle(s.blanks[bi].choices) }] };
+  }
+
+  function buildDrill(subj, type, count) {
+    if (subj === 'yogo') {
+      return pickPriority(BANK.yogo.terms, (t) => t.id, LS.miss, count).map((t, i) => ({
+        kind: 'yogo', title: String(i + 1), terms: [{ id: t.id, meaning: t.meaning, hint: t.hint || '', term: t.term, accept: t.accept || [] }],
+      }));
+    }
+    if (subj === 'kiso') {
+      const pool = [];
+      BANK.kiso.sections.filter((s) => s.core).forEach((s) => s.blanks.forEach((b, bi) => pool.push({ s, bi })));
+      return pickPriority(pool, (x) => `${x.s.id}-${x.bi}`, LS.missKiso, count).map((x) => kisoOne(x.s, x.bi));
+    }
+    const tpls = type === 'trainee' ? Keisu.TRAINEE : Keisu.TOYO;
+    return pickPriority(tpls, (t) => t.id, LS.missKeisu, count).map((t, i) => {
+      const p = Object.assign({ kind: 'keisu', title: `問${i + 1}`, id: t.id, name: t.name }, t.gen());
+      if (p.items.length > 8 && p.items.every((it) => it.type === 'choice')) p.items = shuffle(p.items).slice(0, 5); // 公式の穴埋めは5問に絞る
+      return p;
+    });
   }
 
   // 小問の一覧（採点・進捗用）
@@ -186,13 +223,14 @@
           <p class="muted" style="margin-top:10px">計数の数値と初歩用語の出題語は毎回変わります。時間になると自動で提出されます。</p>
         </section>
         <section class="card">
-          <h2>科目別の練習（時間制限なし）</h2>
+          <h2>科目別の練習（1回5〜10分）</h2>
           <div class="btn-grid">
-            <button class="btn" data-act="practice" data-subj="kiso" data-type="toyo">基礎知識</button>
-            <button class="btn" data-act="drill">初歩用語（一問一答）</button>
-            <button class="btn" data-act="practice" data-subj="keisu" data-type="toyo">計数（登用形式）</button>
-            <button class="btn" data-act="practice" data-subj="keisu" data-type="trainee">計数（トレーニー形式）</button>
+            <button class="btn" data-act="drill" data-subj="kiso" data-type="toyo">基礎知識</button>
+            <button class="btn" data-act="drill" data-subj="yogo" data-type="toyo">初歩用語</button>
+            <button class="btn" data-act="drill" data-subj="keisu" data-type="toyo">計数（登用形式）</button>
+            <button class="btn" data-act="drill" data-subj="keisu" data-type="trainee">計数（トレーニー形式）</button>
           </div>
+          <p class="muted" style="margin-top:10px">1問（計数は1題）ずつ、その場で答え合わせをします。前に間違えた問題を優先して出します。</p>
         </section>
         <section class="card">
           <div class="row" style="margin-bottom:6px"><h2 class="grow" style="margin:0">受験履歴</h2>
@@ -209,11 +247,16 @@
     document.getElementById('importFile').addEventListener('change', importHistory);
   }
 
+  function recTitle(h) {
+    if (h.mode === 'honban') return EXAM_TYPES[h.type];
+    const k = Object.keys(h.result.scores)[0];
+    return k === 'keisu' ? `計数（${h.type === 'trainee' ? 'トレーニー' : '登用'}形式）の練習` : `${SUBJECTS[k]}の練習`;
+  }
   function histRow(h) {
     const r = h.result;
     const label = h.mode === 'honban' ? `<span class="badge ${r.pass ? 'ok' : 'ng'}">${r.pass ? '合格' : '不合格'}</span>` : '<span class="badge pr">練習</span>';
     const sc = Object.keys(r.scores).map((k) => `${SUBJECTS[k]} ${r.scores[k].score}`).join('　');
-    return `<li><button data-act="record" data-id="${esc(h.id)}">${label}<span class="grow"><b>${esc(EXAM_TYPES[h.type])}</b>　<span class="muted">${fmtDate(h.submittedAt)}</span><br><span class="muted">${esc(sc)}</span></span><span class="muted">›</span></button></li>`;
+    return `<li><button data-act="record" data-id="${esc(h.id)}">${label}<span class="grow"><b>${esc(recTitle(h))}</b>　<span class="muted">${fmtDate(h.submittedAt)}</span><br><span class="muted">${esc(sc)}</span></span><span class="muted">›</span></button></li>`;
   }
 
   function homeAction(d) {
@@ -223,13 +266,16 @@
     if (d.act === 'export') return exportHistory();
     if (d.act === 'import') return document.getElementById('importFile').click();
     if (d.act === 'drill') {
-      const missN = Object.values(load(LS.miss, {})).filter((v) => v > 0).length;
-      openSheet(`<h3>初歩用語（一問一答）</h3><p class="muted">1問ずつ答えて、すぐに正解を確認できます。${missN ? `前に間違えた語（${missN}語）を優先して出題します。` : ''}</p>
-        <div class="choices">${DRILL_COUNTS.map((n) => `<button class="btn primary" data-n="${n}">${n} 問</button>`).join('')}</div>
+      const subj = d.subj, unit = subj === 'keisu' ? '題' : '問';
+      const missN = Object.values(load(MISS_KEY[subj], {})).filter((v) => v > 0).length;
+      const title = subj === 'keisu' ? `計数（${d.type === 'trainee' ? 'トレーニー' : '登用'}形式）` : SUBJECTS[subj];
+      const how = { kiso: '空欄1つずつ4択で答えます。', yogo: '意味を見て用語を入力します。', keisu: '大問を1題ずつ解いて、答え合わせをします。' }[subj];
+      openSheet(`<h3>${esc(title)}の練習</h3><p class="muted">${how}${missN ? `前に間違えた問題（${missN}）を優先して出します。` : ''}</p>
+        <div class="choices">${DRILL_COUNTS[subj].map((n) => `<button class="btn primary" data-n="${n}">${n} ${unit}<span style="font-weight:400;font-size:13px">（約${Math.max(1, Math.round(n * DRILL_MIN[subj]))}分）</span></button>`).join('')}</div>
         <div style="margin-top:12px"><button class="btn ghost" data-close>やめる</button></div>`);
       $sheet.querySelectorAll('[data-n]').forEach((b) => b.addEventListener('click', () => {
         if (load(LS.current, null) && !confirm('途中の受験データがあります。破棄して新しく始めますか？')) return;
-        exam = newExam('toyo', 'drill', ['yogo'], Number(b.dataset.n));
+        exam = newExam(d.type || 'toyo', 'drill', [subj], Number(b.dataset.n));
         saveCurrent(true);
         enterExam();
       }));
@@ -287,76 +333,115 @@
     ui.subj = 0; ui.page = 0;
     if (exam.mode === 'drill') {
       exam.checked = exam.checked || {};
-      const first = exam.subjects[0].pages.findIndex((p, pi) => !exam.checked[`0-${pi}-0`]);
+      const first = exam.subjects[0].pages.findIndex((p, pi) => !drillChecked(pi));
       ui.page = first < 0 ? exam.subjects[0].pages.length - 1 : first;
     }
     go('exam');
   }
 
-  // ================= 一問一答（初歩用語の練習） =================
+  // ================= 科目別の練習（1問ずつ答え合わせ） =================
+  const drillChecked = (pi) => !!(exam.checked[`p${pi}`] || exam.checked[`0-${pi}-0`]);
+
   function renderDrill() {
-    const pages = exam.subjects[0].pages;
-    const pi = ui.page, key = `0-${pi}-0`;
-    const t = pages[pi].terms[0];
-    const checked = !!exam.checked[key];
-    const v = exam.ans[key] || '';
-    const done = Object.keys(exam.checked).length;
-    const okN = Object.keys(exam.checked).filter((k) => exam.checked[k] === 'ok').length;
-    const ok = checked && exam.checked[key] === 'ok';
+    const s = exam.subjects[0], pages = s.pages, pi = ui.page, p = pages[pi];
+    const items = itemsOf(s, 0);
+    const mine = items.filter((x) => x.pi === pi);
+    const checked = drillChecked(pi);
+    const doneItems = items.filter((x) => drillChecked(x.pi));
+    const okN = doneItems.filter((x) => isCorrect(x, exam.ans[x.key])).length;
+    const donePages = pages.filter((_, i) => drillChecked(i)).length;
     const last = pi === pages.length - 1;
-    const others = (t.accept || []).filter((a) => normTerm(a) !== normTerm(t.term));
+    const subjLabel = s.key === 'keisu' ? `計数（${exam.type === 'trainee' ? 'トレーニー' : '登用'}形式）` : SUBJECTS[s.key];
+    const resultBox = (ok, answerHtml, yourHtml) => `<div class="drill-result ${ok ? 'ok' : 'ng'}"><div class="mark">${ok ? '◯ 正解' : '✕ 不正解'}</div><div>正解：${answerHtml}</div>${ok ? '' : `<div class="muted">あなたの答え：${yourHtml}</div>`}</div>`;
+
+    let body = '', foot = '';
+    const nextBtn = `<button class="btn primary" data-act="${last ? 'finish' : 'dnext'}">${last ? '結果を見る' : '次へ ›'}</button>`;
+
+    if (p.kind === 'yogo') {
+      const x = mine[0], t = x.t, v = exam.ans[x.key] || '', ok = isCorrect(x, v);
+      const others = (t.accept || []).filter((a) => normTerm(a) !== normTerm(t.term));
+      body = `<p class="muted" style="margin:0 0 6px">意味にあてはまる用語を書きなさい。</p>
+        <p style="font-size:18px;margin:0 0 8px">${esc(t.meaning)}</p>
+        ${t.hint ? `<div class="muted" style="margin-bottom:8px;font-size:12px">ヒント：${esc(t.hint)}</div>` : ''}
+        <form id="drillForm" action="#" autocomplete="off"><input id="drillIn" type="text" enterkeyhint="${checked ? 'next' : 'done'}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="用語を入力" value="${esc(v)}" ${checked ? 'readonly' : ''}></form>
+        ${checked ? resultBox(ok, `<b>${esc(t.term)}</b>${others.length ? `<span class="muted">（${others.map(esc).join('・')} も可）</span>` : ''}`, answered(v) ? esc(v) : '（わからない）') : ''}`;
+      foot = checked ? `<span></span>${nextBtn}` : '<button class="btn" data-act="skip">わからない</button><button class="btn primary" data-act="check">回答する</button>';
+    } else if (p.kind === 'kiso') {
+      const x = mine[0], b = p.blanks[0], v = exam.ans[x.key], ok = isCorrect(x, v);
+      const text = esc(p.text).replace('{{0}}', checked ? `<span class="blank filled ${ok ? '' : 'wrong'}">${esc(b.answer)}</span>` : '<span class="blank active">　？　</span>');
+      body = `<p class="muted" style="margin:0 0 4px">${esc(p.title)}</p>
+        <div class="kiso-text" style="font-size:17px">${text}</div>
+        <div class="choices" style="margin-top:12px">${b.choices.map((c) => `<button class="choice ${checked && c === b.answer ? 'right' : ''} ${checked && c === v && c !== b.answer ? 'bad' : ''}" data-act="pick" data-val="${esc(c)}" ${checked ? 'disabled' : ''}>${esc(c)}</button>`).join('')}</div>
+        ${checked ? resultBox(ok, `<b>${esc(b.answer)}</b>`, answered(v) ? esc(v) : '（わからない）') : ''}`;
+      foot = checked ? `<span></span>${nextBtn}` : '<button class="btn" data-act="skip">わからない</button><span></span>';
+    } else {
+      if (!checked) {
+        body = renderPage(p, 0, pi).replace(/^<section class="card">|<\/section>$/g, '');
+        foot = '<span></span><button class="btn primary" data-act="check">答え合わせ</button>';
+      } else {
+        const c = mine.filter((x) => isCorrect(x, exam.ans[x.key])).length;
+        body = `<div class="qhead"><h2>${esc(p.title)}　${esc(p.name || '')}</h2><span class="badge ${c === mine.length ? 'ok' : 'ng'}">${c} / ${mine.length} 正解</span></div>
+          <p class="qtext">${esc(p.text)}</p>${p.rule ? `<p class="rule">※${esc(p.rule)}</p>` : ''}${renderTable(p.table)}
+          ${mine.map((x) => {
+            const it = x.it, v = exam.ans[x.key], ok = isCorrect(x, v);
+            const ans = it.type === 'choice' ? esc(it.ans) : `${esc(Keisu.fmt(it.ans, it.dec))} ${esc(it.unit || '')}${it.alt && it.alt.length ? `（${it.alt.map((a) => esc(Keisu.fmt(a, it.dec))).join('・')}も可）` : ''}`;
+            return `${it.pre ? `<div class="pre">${esc(it.pre)}</div>` : ''}<div class="item"><p class="q">${ok ? '<b style="color:var(--ok)">◯</b>' : '<b style="color:var(--ng)">✕</b>'} ${esc(it.q)}</p>
+              <div class="ans">正解：<b>${ans}</b>　<span class="mine ${ok ? 'ok' : ''}">あなた：${answered(v) ? esc(v) : '（未回答）'}</span></div>
+              <div class="exp" style="background:var(--bg);border-radius:8px;padding:8px 10px;margin-top:6px;font-size:13px;white-space:pre-wrap">${it.exp.map(esc).join('\n')}</div></div>`;
+          }).join('')}`;
+        foot = `<span></span>${nextBtn}`;
+      }
+    }
+
     $app.innerHTML = `
       <div class="exambar"><div class="top" style="padding-bottom:8px">
         <button class="btn small ghost" data-act="home">‹ 中断</button>
-        <div class="grow" style="text-align:center"><div class="muted" style="line-height:1.2">初歩用語・一問一答</div><div class="timer">${pi + 1} / ${pages.length}</div></div>
-        <span class="badge ok" style="font-size:14px">正解 ${okN}/${done}</span>
+        <div class="grow" style="text-align:center"><div class="muted" style="line-height:1.2">${esc(subjLabel)}・練習</div><div class="timer">${pi + 1} / ${pages.length}</div></div>
+        <span class="badge ok" style="font-size:14px">正解 ${okN}/${doneItems.length}</span>
       </div></div>
-      <div class="progress"><i style="width:${done / pages.length * 100}%"></i></div>
-      <main class="wrap">
-        <section class="card">
-          <p class="muted" style="margin:0 0 6px">意味にあてはまる用語を書きなさい。</p>
-          <p style="font-size:18px;margin:0 0 8px">${esc(t.meaning)}</p>
-          ${t.hint ? `<div class="hint muted" style="margin-bottom:8px">ヒント：${esc(t.hint)}</div>` : ''}
-          <form id="drillForm" action="#" autocomplete="off"><input id="drillIn" type="text" enterkeyhint="${checked ? 'next' : 'done'}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="用語を入力" value="${esc(v)}" ${checked ? 'readonly' : ''}></form>
-          ${checked ? `<div class="drill-result ${ok ? 'ok' : 'ng'}">
-              <div class="mark">${ok ? '◯ 正解' : '✕ 不正解'}</div>
-              <div>正解：<b>${esc(t.term)}</b>${others.length ? `<span class="muted">（${others.map(esc).join('・')} も可）</span>` : ''}</div>
-              ${ok ? '' : `<div class="muted">あなたの答え：${answered(v) ? esc(v) : '（わからない）'}</div>`}
-            </div>` : ''}
-        </section>
-      </main>
-      <nav class="pager" style="grid-template-columns:1fr 1fr">
-        ${checked
-          ? `<span></span><button class="btn primary" data-act="${last ? 'finish' : 'dnext'}">${last ? '結果を見る' : '次の問題へ ›'}</button>`
-          : '<button class="btn" data-act="skip">わからない</button><button class="btn primary" data-act="check">回答する</button>'}
-      </nav>`;
-    const $in = document.getElementById('drillIn');
-    const act = (a) => {
+      <div class="progress"><i style="width:${donePages / pages.length * 100}%"></i></div>
+      <main class="wrap"><section class="card">${body}</section></main>
+      <nav class="pager" style="grid-template-columns:1fr 1fr">${foot}</nav>`;
+    window.scrollTo(0, 0);
+
+    const judge = () => {
+      exam.checked[`p${pi}`] = true;
+      const good = mine.every((x) => isCorrect(x, exam.ans[x.key]));
+      const id = p.kind === 'yogo' ? p.terms[0].id : p.id;
+      if (id) markMiss(MISS_KEY[s.key], id, good);
+      saveCurrent(true);
+      renderDrill();
+      const nb = $app.querySelector('[data-act="dnext"],[data-act="finish"]');
+      if (nb) nb.focus({ preventScroll: true });
+    };
+    const act = (dset) => {
+      const a = dset.act;
       if (a === 'home') { saveCurrent(true); exam = null; go('home'); return; }
-      if (a === 'check' || a === 'skip') {
-        if (a === 'check' && !answered($in.value)) { $in.focus(); return; }
-        exam.ans[key] = a === 'skip' ? '' : $in.value;
-        const good = a === 'check' && acceptList(t).has(normTerm($in.value));
-        exam.checked[key] = good ? 'ok' : 'ng';
-        const miss = load(LS.miss, {});
-        if (good) { if (miss[t.id]) { miss[t.id] -= 1; if (miss[t.id] <= 0) delete miss[t.id]; } } else { miss[t.id] = (miss[t.id] || 0) + 1; }
-        store(LS.miss, miss);
-        saveCurrent(true);
-        renderDrill();
-        const nextBtn = $app.querySelector('[data-act="dnext"],[data-act="finish"]');
-        if (nextBtn) nextBtn.focus();
+      if (a === 'pick') { exam.ans[mine[0].key] = dset.val; judge(); return; }
+      if (a === 'skip') { exam.ans[mine[0].key] = ''; judge(); return; }
+      if (a === 'check') {
+        if (p.kind === 'yogo') { const $in = document.getElementById('drillIn'); if (!answered($in.value)) { $in.focus(); return; } exam.ans[mine[0].key] = $in.value; }
+        if (p.kind === 'keisu' && !mine.some((x) => answered(exam.ans[x.key])) && !confirm('まだ何も入力していません。答え合わせをしますか？')) return;
+        judge(); return;
+      }
+      if (a === 'choice') { // 計数の選択式
+        exam.ans[dset.key] = dset.val; saveCurrent();
+        $app.querySelectorAll(`.choice[data-key="${dset.key}"]`).forEach((c) => c.classList.toggle('on', c.dataset.val === dset.val));
         return;
       }
       if (a === 'dnext') { ui.page++; renderDrill(); const i = document.getElementById('drillIn'); if (i) i.focus(); return; }
       if (a === 'finish') submit(false);
     };
-    $app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset.act)));
-    // キーボードの確定（改行）キーはフォーム送信として受ける（スマホの日本語入力でも確実に反応する）
-    document.getElementById('drillForm').addEventListener('submit', (ev) => {
-      ev.preventDefault();
-      act(checked ? (last ? 'finish' : 'dnext') : 'check');
-    });
-    if (!checked) $in.addEventListener('input', () => { exam.ans[key] = $in.value; saveCurrent(); });
+    $app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset)));
+    const form = document.getElementById('drillForm');
+    if (form) form.addEventListener('submit', (ev) => { ev.preventDefault(); act({ act: checked ? (last ? 'finish' : 'dnext') : 'check' }); });
+    if (p.kind === 'keisu' && !checked) {
+      const inputs = Array.from($app.querySelectorAll('input[data-key]'));
+      inputs.forEach((inp, idx) => {
+        inp.addEventListener('input', () => { exam.ans[inp.dataset.key] = inp.value; saveCurrent(); });
+        inp.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' && !ev.isComposing) { ev.preventDefault(); if (idx < inputs.length - 1) inputs[idx + 1].focus(); else inp.blur(); } });
+      });
+    }
   }
 
   function subjProgress(si) {
@@ -575,7 +660,7 @@
       <header class="appbar"><div class="row"><button class="btn small ghost" style="color:inherit;border-color:rgba(255,255,255,.4)" data-act="home">‹ ホーム</button><h1 class="grow" style="text-align:center">採点結果</h1><span style="width:70px"></span></div></header>
       <main class="wrap">
         <section class="verdict ${honban ? (r.pass ? 'ok' : 'ng') : 'ok'}">
-          <div class="muted" style="color:inherit">${esc(EXAM_TYPES[h.type])}　${honban ? '本番モード' : '練習'}</div>
+          <div class="muted" style="color:inherit">${honban ? `${esc(EXAM_TYPES[h.type])}　本番モード` : esc(recTitle(h))}</div>
           <div class="big">${honban ? (r.pass ? '合　格' : '不合格') : '練習結果'}</div>
           <div class="meta">${esc(h.name || '（氏名未入力）')}　${fmtDate(h.submittedAt)}　所要 ${fmtDur(h.submittedAt - h.startedAt)}${h.auto ? '（時間切れ提出）' : ''}</div>
           <div class="meta">確認コード <span class="code">${esc(h.code)}</span></div>

@@ -149,6 +149,13 @@ table.tbl { border-collapse: collapse; font-size: 13px; min-width: 100%; }
 .drill-result.ok .mark { color: var(--ok); }
 .drill-result.ng .mark { color: var(--ng); }
 input[readonly] { background: var(--bg); }
+.choice.right { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); font-weight: 700; }
+.choice.bad { border-color: var(--ng); background: var(--ng-soft); color: var(--ng); text-decoration: line-through; }
+.choice:disabled { opacity: 1; cursor: default; }
+.blank.wrong { border-color: var(--ng); }
+.item .ans { font-size: 14px; }
+.item .mine { color: var(--ng); }
+.item .mine.ok { color: var(--ok); }
 
 .pager {
   position: sticky; bottom: 0; background: var(--card); border-top: 1px solid var(--line);
