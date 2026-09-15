@@ -2,8 +2,9 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '2026.09.15';
-  const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name' };
+  const APP_VERSION = '2026.09.15c';
+  const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss' };
+  const DRILL_COUNTS = [10, 20, 30];
   const SUBJECTS = { kiso: '基礎知識', keisu: '計数', yogo: '初歩用語' };
   const EXAM_TYPES = { toyo: '登用試験', trainee: 'トレーニー試験' };
   const LIMIT_MIN = 90;
@@ -75,15 +76,26 @@
     return pages;
   }
 
-  function newExam(type, mode, subjects) {
+  function newExam(type, mode, subjects, drillCount) {
     const now = Date.now();
     const e = {
       id: 'e' + now.toString(36) + Math.random().toString(36).slice(2, 6), app: APP_VERSION,
       type, mode, name: (load(LS.name, '') || '').trim(), startedAt: now,
       deadline: mode === 'honban' ? now + LIMIT_MIN * 60 * 1000 : null,
-      subjects: subjects.map((k) => ({ key: k, pages: buildSubject(k, type) })), ans: {},
+      subjects: subjects.map((k) => ({ key: k, pages: mode === 'drill' ? buildDrill(drillCount) : buildSubject(k, type) })), ans: {}, checked: {},
     };
     return e;
+  }
+
+  // 初歩用語の一問一答：前に間違えた語を最大半分まで優先して出す
+  function buildDrill(count) {
+    const miss = load(LS.miss, {});
+    const terms = BANK.yogo.terms;
+    const missed = shuffle(terms.filter((t) => miss[t.id] > 0)).slice(0, Math.floor(count / 2));
+    const rest = shuffle(terms.filter((t) => !missed.includes(t)));
+    return shuffle(missed.concat(rest.slice(0, count - missed.length))).map((t, i) => ({
+      kind: 'yogo', title: String(i + 1), terms: [{ id: t.id, meaning: t.meaning, hint: t.hint || '', term: t.term, accept: t.accept || [] }],
+    }));
   }
 
   // 小問の一覧（採点・進捗用）
@@ -177,7 +189,7 @@
           <h2>科目別の練習（時間制限なし）</h2>
           <div class="btn-grid">
             <button class="btn" data-act="practice" data-subj="kiso" data-type="toyo">基礎知識</button>
-            <button class="btn" data-act="practice" data-subj="yogo" data-type="toyo">初歩用語</button>
+            <button class="btn" data-act="drill">初歩用語（一問一答）</button>
             <button class="btn" data-act="practice" data-subj="keisu" data-type="toyo">計数（登用形式）</button>
             <button class="btn" data-act="practice" data-subj="keisu" data-type="trainee">計数（トレーニー形式）</button>
           </div>
@@ -210,6 +222,19 @@
     if (d.act === 'record') { go('result', { recordId: d.id, reviewSubj: null, reviewAll: false }); return; }
     if (d.act === 'export') return exportHistory();
     if (d.act === 'import') return document.getElementById('importFile').click();
+    if (d.act === 'drill') {
+      const missN = Object.values(load(LS.miss, {})).filter((v) => v > 0).length;
+      openSheet(`<h3>初歩用語（一問一答）</h3><p class="muted">1問ずつ答えて、すぐに正解を確認できます。${missN ? `前に間違えた語（${missN}語）を優先して出題します。` : ''}</p>
+        <div class="choices">${DRILL_COUNTS.map((n) => `<button class="btn primary" data-n="${n}">${n} 問</button>`).join('')}</div>
+        <div style="margin-top:12px"><button class="btn ghost" data-close>やめる</button></div>`);
+      $sheet.querySelectorAll('[data-n]').forEach((b) => b.addEventListener('click', () => {
+        if (load(LS.current, null) && !confirm('途中の受験データがあります。破棄して新しく始めますか？')) return;
+        exam = newExam('toyo', 'drill', ['yogo'], Number(b.dataset.n));
+        saveCurrent(true);
+        enterExam();
+      }));
+      return;
+    }
     if (d.act === 'start' || d.act === 'practice') {
       if (load(LS.current, null) && !confirm('途中の受験データがあります。破棄して新しく始めますか？')) return;
       if (d.act === 'start') {
@@ -260,7 +285,78 @@
   function enterExam() {
     if (exam.deadline && Date.now() >= exam.deadline) { submit(true); return; }
     ui.subj = 0; ui.page = 0;
+    if (exam.mode === 'drill') {
+      exam.checked = exam.checked || {};
+      const first = exam.subjects[0].pages.findIndex((p, pi) => !exam.checked[`0-${pi}-0`]);
+      ui.page = first < 0 ? exam.subjects[0].pages.length - 1 : first;
+    }
     go('exam');
+  }
+
+  // ================= 一問一答（初歩用語の練習） =================
+  function renderDrill() {
+    const pages = exam.subjects[0].pages;
+    const pi = ui.page, key = `0-${pi}-0`;
+    const t = pages[pi].terms[0];
+    const checked = !!exam.checked[key];
+    const v = exam.ans[key] || '';
+    const done = Object.keys(exam.checked).length;
+    const okN = Object.keys(exam.checked).filter((k) => exam.checked[k] === 'ok').length;
+    const ok = checked && exam.checked[key] === 'ok';
+    const last = pi === pages.length - 1;
+    const others = (t.accept || []).filter((a) => normTerm(a) !== normTerm(t.term));
+    $app.innerHTML = `
+      <div class="exambar"><div class="top" style="padding-bottom:8px">
+        <button class="btn small ghost" data-act="home">‹ 中断</button>
+        <div class="grow" style="text-align:center"><div class="muted" style="line-height:1.2">初歩用語・一問一答</div><div class="timer">${pi + 1} / ${pages.length}</div></div>
+        <span class="badge ok" style="font-size:14px">正解 ${okN}/${done}</span>
+      </div></div>
+      <div class="progress"><i style="width:${done / pages.length * 100}%"></i></div>
+      <main class="wrap">
+        <section class="card">
+          <p class="muted" style="margin:0 0 6px">意味にあてはまる用語を書きなさい。</p>
+          <p style="font-size:18px;margin:0 0 8px">${esc(t.meaning)}</p>
+          ${t.hint ? `<div class="hint muted" style="margin-bottom:8px">ヒント：${esc(t.hint)}</div>` : ''}
+          <form id="drillForm" action="#" autocomplete="off"><input id="drillIn" type="text" enterkeyhint="${checked ? 'next' : 'done'}" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="用語を入力" value="${esc(v)}" ${checked ? 'readonly' : ''}></form>
+          ${checked ? `<div class="drill-result ${ok ? 'ok' : 'ng'}">
+              <div class="mark">${ok ? '◯ 正解' : '✕ 不正解'}</div>
+              <div>正解：<b>${esc(t.term)}</b>${others.length ? `<span class="muted">（${others.map(esc).join('・')} も可）</span>` : ''}</div>
+              ${ok ? '' : `<div class="muted">あなたの答え：${answered(v) ? esc(v) : '（わからない）'}</div>`}
+            </div>` : ''}
+        </section>
+      </main>
+      <nav class="pager" style="grid-template-columns:1fr 1fr">
+        ${checked
+          ? `<span></span><button class="btn primary" data-act="${last ? 'finish' : 'dnext'}">${last ? '結果を見る' : '次の問題へ ›'}</button>`
+          : '<button class="btn" data-act="skip">わからない</button><button class="btn primary" data-act="check">回答する</button>'}
+      </nav>`;
+    const $in = document.getElementById('drillIn');
+    const act = (a) => {
+      if (a === 'home') { saveCurrent(true); exam = null; go('home'); return; }
+      if (a === 'check' || a === 'skip') {
+        if (a === 'check' && !answered($in.value)) { $in.focus(); return; }
+        exam.ans[key] = a === 'skip' ? '' : $in.value;
+        const good = a === 'check' && acceptList(t).has(normTerm($in.value));
+        exam.checked[key] = good ? 'ok' : 'ng';
+        const miss = load(LS.miss, {});
+        if (good) { if (miss[t.id]) { miss[t.id] -= 1; if (miss[t.id] <= 0) delete miss[t.id]; } } else { miss[t.id] = (miss[t.id] || 0) + 1; }
+        store(LS.miss, miss);
+        saveCurrent(true);
+        renderDrill();
+        const nextBtn = $app.querySelector('[data-act="dnext"],[data-act="finish"]');
+        if (nextBtn) nextBtn.focus();
+        return;
+      }
+      if (a === 'dnext') { ui.page++; renderDrill(); const i = document.getElementById('drillIn'); if (i) i.focus(); return; }
+      if (a === 'finish') submit(false);
+    };
+    $app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset.act)));
+    // キーボードの確定（改行）キーはフォーム送信として受ける（スマホの日本語入力でも確実に反応する）
+    document.getElementById('drillForm').addEventListener('submit', (ev) => {
+      ev.preventDefault();
+      act(checked ? (last ? 'finish' : 'dnext') : 'check');
+    });
+    if (!checked) $in.addEventListener('input', () => { exam.ans[key] = $in.value; saveCurrent(); });
   }
 
   function subjProgress(si) {
@@ -270,6 +366,7 @@
   }
 
   function renderExam() {
+    if (exam.mode === 'drill') return renderDrill();
     const s = exam.subjects[ui.subj];
     const page = s.pages[ui.page];
     const pr = subjProgress(ui.subj);
@@ -384,16 +481,25 @@
     if (d.act === 'blank') { openBlank(Number(d.bi)); }
   }
 
-  // 穴埋めの選択シート
+  // 穴埋めの選択パネル：画面下に小さく出し、問題文は隠さない（該当の空欄をパネルの上へスクロール）
   function openBlank(bi) {
     const p = exam.subjects[ui.subj].pages[ui.page];
     const b = p.blanks[bi];
     const key = `${ui.subj}-${ui.page}-${bi}`;
-    const line = (p.text.split('\n').find((l) => l.includes(`{{${bi}}}`)) || '')
-      .replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === bi ? '【？】' : '＿'));
-    openSheet(`<h3>${circled(bi)} にあてはまる語句</h3><p class="muted" style="white-space:pre-wrap">${esc(line.trim())}</p>
-      <div class="choices">${b.choices.map((c) => `<button class="choice ${exam.ans[key] === c ? 'on' : ''}" data-val="${esc(c)}">${esc(c)}</button>`).join('')}</div>
-      <div class="btn-grid" style="margin-top:12px"><button class="btn ghost" data-close>閉じる</button><button class="btn ghost" data-clear>選択を消す</button></div>`);
+    const long = b.choices.some((c) => c.length > 9);
+    openSheet(`<div class="row" style="margin-bottom:8px"><h3 class="grow" style="margin:0">${circled(bi)} にあてはまる語句</h3>
+        <button class="btn small ghost" data-clear>消す</button><button class="btn small ghost" data-close>閉じる ✕</button></div>
+      <div class="choices ${long ? '' : 'two'}">${b.choices.map((c) => `<button class="choice ${exam.ans[key] === c ? 'on' : ''}" data-val="${esc(c)}">${esc(c)}</button>`).join('')}</div>`, 'dock');
+    $app.querySelectorAll('.blank.active').forEach((el) => el.classList.remove('active'));
+    const el = $app.querySelector(`.blank[data-bi="${bi}"]`);
+    if (el) {
+      el.classList.add('active');
+      const h = $sheet.querySelector('.panel').offsetHeight;
+      document.body.style.paddingBottom = `${h}px`;
+      const r = el.getBoundingClientRect();
+      const visible = window.innerHeight - h;
+      window.scrollBy({ top: r.top - visible * 0.45, behavior: 'smooth' });
+    }
     $sheet.querySelectorAll('.choice').forEach((c) => c.addEventListener('click', () => {
       exam.ans[key] = c.dataset.val; saveCurrent(); updateBlank(bi);
       const next = p.blanks.findIndex((x, j) => j > bi && !answered(exam.ans[`${ui.subj}-${ui.page}-${j}`]));
@@ -430,12 +536,17 @@
     });
   }
 
-  function openSheet(html) {
-    $sheet.innerHTML = `<div class="panel" role="dialog" aria-modal="true">${html}</div>`;
+  function openSheet(html, variant) {
+    $sheet.className = `sheet ${variant || ''}`;
+    $sheet.innerHTML = `<div class="panel" role="dialog" aria-modal="${variant === 'dock' ? 'false' : 'true'}">${html}</div>`;
     $sheet.hidden = false;
     $sheet.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', closeSheet));
   }
-  function closeSheet() { $sheet.hidden = true; $sheet.innerHTML = ''; }
+  function closeSheet() {
+    $sheet.hidden = true; $sheet.innerHTML = ''; $sheet.className = 'sheet';
+    document.body.style.paddingBottom = '';
+    $app.querySelectorAll('.blank.active').forEach((el) => el.classList.remove('active'));
+  }
   $sheet.addEventListener('click', (ev) => { if (ev.target === $sheet) closeSheet(); });
 
   function submit(auto) {

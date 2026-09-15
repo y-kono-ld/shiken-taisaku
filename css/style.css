@@ -142,6 +142,14 @@ table.tbl { border-collapse: collapse; font-size: 13px; min-width: 100%; }
 .yogo .m { margin: 0 0 6px; }
 .yogo .hint { font-size: 12px; color: var(--sub); }
 
+.drill-result { margin-top: 12px; border-radius: 12px; padding: 12px 14px; }
+.drill-result.ok { background: var(--ok-soft); }
+.drill-result.ng { background: var(--ng-soft); }
+.drill-result .mark { font-size: 22px; font-weight: 800; margin-bottom: 2px; }
+.drill-result.ok .mark { color: var(--ok); }
+.drill-result.ng .mark { color: var(--ng); }
+input[readonly] { background: var(--bg); }
+
 .pager {
   position: sticky; bottom: 0; background: var(--card); border-top: 1px solid var(--line);
   padding: 10px 12px calc(10px + env(safe-area-inset-bottom)); display: grid; grid-template-columns: 1fr auto 1fr; gap: 8px; align-items: center; z-index: 9;
@@ -156,6 +164,13 @@ table.tbl { border-collapse: collapse; font-size: 13px; min-width: 100%; }
   padding: 16px 16px calc(16px + env(safe-area-inset-bottom));
 }
 .sheet .panel h3 { margin: 0 0 10px; font-size: 16px; }
+/* 穴埋め用：背景を暗くせず、画面下に小さく出すパネル */
+.sheet.dock { background: transparent; pointer-events: none; }
+.sheet.dock .panel { pointer-events: auto; max-height: 48vh; padding-top: 12px; box-shadow: 0 -4px 20px rgba(10, 20, 40, .18); border-top: 1px solid var(--line); }
+.choices.two { grid-template-columns: 1fr 1fr; }
+.sheet.dock .choice { min-height: 44px; padding: 9px 10px; }
+.blank.active { outline: 3px solid var(--accent); outline-offset: 1px; }
+
 .navgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(52px, 1fr)); gap: 6px; margin: 6px 0 14px; }
 .navgrid button { min-height: 44px; border-radius: 8px; border: 1px solid var(--line); background: var(--card); cursor: pointer; font-size: 14px; }
 .navgrid button.done { background: var(--primary-soft); border-color: var(--primary); color: var(--primary); font-weight: 700; }
