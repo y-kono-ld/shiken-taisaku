@@ -157,6 +157,7 @@ input[readonly] { background: var(--bg); }
 .choice.right { border-color: var(--ok); background: var(--ok-soft); color: var(--ok); font-weight: 700; }
 .choice.bad { border-color: var(--ng); background: var(--ng-soft); color: var(--ng); text-decoration: line-through; }
 .choice:disabled { opacity: 1; cursor: default; }
+.given-word { color: var(--sub); text-decoration: underline dotted; text-underline-offset: 4px; }
 .blank.wrong { border-color: var(--ng); }
 .item .ans { font-size: 14px; }
 .item .mine { color: var(--ng); }

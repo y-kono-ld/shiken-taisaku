@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '2026.09.15f';
+  const APP_VERSION = '2026.09.15g';
   const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss', missKiso: 'shiken.v1.kisoMiss', missKeisu: 'shiken.v1.keisuMiss' };
   // 練習1回の出題数と目安時間（分/問）
   const DRILL_COUNTS = { kiso: [10, 20, 30], yogo: [10, 20, 30], keisu: [5, 10, 15] };
@@ -112,7 +112,8 @@
   function kisoOne(s, bi) {
     const lines = s.text.split('\n');
     const li = lines.findIndex((l) => l.includes(`{{${bi}}}`));
-    const fill = (l, target) => l.replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === target ? '{{0}}' : (target === null ? s.blanks[Number(n)].answer : '＿＿'))).trim();
+    // 出題する空欄だけ {{0}}、同じ行のほかの空欄は答えを〔〕で埋めて文として読めるようにする
+    const fill = (l, target) => l.replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === target ? '{{0}}' : `〔${s.blanks[Number(n)].answer}〕`)).trim();
     let ctx = '';
     for (let j = li - 1; j >= 0; j--) { if (/^\s*[○〈ⅠⅡⅢⅣⅤ]/.test(lines[j])) { ctx = fill(lines[j], null); break; } }
     return { kind: 'kiso', id: `${s.id}-${bi}`, title: s.title, text: (ctx ? ctx + '\n' : '') + fill(lines[li], bi), blanks: [{ answer: s.blanks[bi].answer, choices: shuffle(s.blanks[bi].choices) }] };
@@ -378,8 +379,10 @@
       foot = checked ? `<span></span>${nextBtn}` : '<button class="btn" data-act="skip">わからない</button><button class="btn primary" data-act="check">回答する</button>';
     } else if (p.kind === 'kiso') {
       const x = mine[0], b = p.blanks[0], v = exam.ans[x.key], ok = isCorrect(x, v);
-      const text = esc(p.text).replace('{{0}}', checked ? `<span class="blank filled ${ok ? '' : 'wrong'}">${esc(b.answer)}</span>` : '<span class="blank active">　？　</span>');
-      body = `<p class="muted" style="margin:0 0 4px">${esc(p.title)}</p>
+      const text = esc(p.text)
+        .replace(/[（(]?〔([^〕]*)〕[）)]?/g, '<span class="given-word">$1</span>')
+        .replace('{{0}}', checked ? `<span class="blank filled ${ok ? '' : 'wrong'}">${esc(b.answer)}</span>` : '<span class="blank active">　？　</span>');
+      body = `<p class="muted" style="margin:0 0 4px">${esc(p.title)}　<b style="color:var(--ink)">「？」にあてはまる語句を選んでください</b></p>
         <div class="kiso-text" style="font-size:17px">${text}</div>
         <div class="choices" style="margin-top:12px">${b.choices.map((c) => `<button class="choice ${checked && c === b.answer ? 'right' : ''} ${checked && c === v && c !== b.answer ? 'bad' : ''}" data-act="pick" data-val="${esc(c)}" ${checked ? 'disabled' : ''}>${esc(c)}</button>`).join('')}</div>
         ${checked ? resultBox(ok, `<b>${esc(b.answer)}</b>`, answered(v) ? esc(v) : '（わからない）') : ''}`;
@@ -715,7 +718,7 @@
         if (x.kind === 'keisu') head += `<p class="muted" style="white-space:pre-wrap;margin:0 0 4px">${esc(x.p.text)}</p>${renderTable(x.p.table)}`;
       }
       if (x.kind === 'kiso') {
-        const line = (x.p.text.split('\n').find((l) => l.includes(`{{${x.bi}}}`)) || '').replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === x.bi ? '【　】' : x.p.blanks[Number(n)].answer));
+        const line = (x.p.text.split('\n').find((l) => l.includes(`{{${x.bi}}}`)) || '').replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === x.bi ? '【　】' : x.p.blanks[Number(n)].answer)).replace(/〔([^〕]*)〕/g, '$1');
         return `${head}<div class="rv"><p class="q">${circled(x.bi)} ${esc(line.trim())}</p><div class="ans">正解：<b>${esc(x.b.answer)}</b></div>${mine(v, ok)}</div>`;
       }
       if (x.kind === 'keisu') {
