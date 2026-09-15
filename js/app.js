@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '2026.09.15e';
+  const APP_VERSION = '2026.09.15f';
   const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss', missKiso: 'shiken.v1.kisoMiss', missKeisu: 'shiken.v1.keisuMiss' };
   // 練習1回の出題数と目安時間（分/問）
   const DRILL_COUNTS = { kiso: [10, 20, 30], yogo: [10, 20, 30], keisu: [5, 10, 15] };
@@ -410,8 +410,7 @@
         <span class="badge ok" style="font-size:14px">正解 ${okN}/${doneItems.length}</span>
       </div></div>
       <div class="progress"><i style="width:${donePages / pages.length * 100}%"></i></div>
-      <main class="wrap"><section class="card">${body}</section></main>
-      <nav class="pager" style="grid-template-columns:1fr 1fr">${foot}</nav>`;
+      <main class="wrap"><section class="card">${body}<div class="drill-actions">${foot}</div></section></main>`;
     window.scrollTo(0, 0);
 
     const judge = () => {

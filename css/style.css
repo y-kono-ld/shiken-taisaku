@@ -144,6 +144,9 @@ table.tbl { border-collapse: collapse; font-size: 13px; min-width: 100%; }
 .yogo .m { margin: 0 0 6px; }
 .yogo .hint { font-size: 12px; color: var(--sub); }
 
+/* 練習のボタンは問題のすぐ下に置く（画面下固定だとスマホのキーボードに隠れるため） */
+.drill-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.drill-actions > span:empty { display: block; }
 .drill-result { margin-top: 12px; border-radius: 12px; padding: 12px 14px; }
 .drill-result.ok { background: var(--ok-soft); }
 .drill-result.ng { background: var(--ng-soft); }
