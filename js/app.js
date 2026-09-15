@@ -2,11 +2,11 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '2026.09.15d';
+  const APP_VERSION = '2026.09.15e';
   const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss', missKiso: 'shiken.v1.kisoMiss', missKeisu: 'shiken.v1.keisuMiss' };
   // 練習1回の出題数と目安時間（分/問）
-  const DRILL_COUNTS = { kiso: [10, 20, 30], yogo: [10, 20, 30], keisu: [3, 5] };
-  const DRILL_MIN = { kiso: 0.3, yogo: 0.4, keisu: 2.5 };
+  const DRILL_COUNTS = { kiso: [10, 20, 30], yogo: [10, 20, 30], keisu: [5, 10, 15] };
+  const DRILL_MIN = { kiso: 0.3, yogo: 0.4, keisu: 1.2 };
   const SUBJECTS = { kiso: '基礎知識', keisu: '計数', yogo: '初歩用語' };
   const EXAM_TYPES = { toyo: '登用試験', trainee: 'トレーニー試験' };
   const LIMIT_MIN = 90;
@@ -105,6 +105,8 @@
     store(missKey, miss);
   }
   const MISS_KEY = { yogo: LS.miss, kiso: LS.missKiso, keisu: LS.missKeisu };
+  // 小問が前の小問の答えを使って解く大問
+  const CHAINED = new Set(['t1-3', 't2-1', 't2-3', 't3-1', 't3-3', 't3-4', 't4-1', 't5-1', 't5-3', 't5-4', 'k-loss', 'k-tofu']);
 
   // 基礎知識の空欄1つを1問にする（直前の見出し行を文脈として添える）
   function kisoOne(s, bi) {
@@ -127,11 +129,19 @@
       BANK.kiso.sections.filter((s) => s.core).forEach((s) => s.blanks.forEach((b, bi) => pool.push({ s, bi })));
       return pickPriority(pool, (x) => `${x.s.id}-${x.bi}`, LS.missKiso, count).map((x) => kisoOne(x.s, x.bi));
     }
+    // 計数は小問1つを1問にする。前の小問の答えを使う大問（CHAINED）だけ「前の問いの答え」を添える
     const tpls = type === 'trainee' ? Keisu.TRAINEE : Keisu.TOYO;
     return pickPriority(tpls, (t) => t.id, LS.missKeisu, count).map((t, i) => {
-      const p = Object.assign({ kind: 'keisu', title: `問${i + 1}`, id: t.id, name: t.name }, t.gen());
-      if (p.items.length > 8 && p.items.every((it) => it.type === 'choice')) p.items = shuffle(p.items).slice(0, 5); // 公式の穴埋めは5問に絞る
-      return p;
+      const prob = t.gen();
+      const ii = Math.floor(Math.random() * prob.items.length);
+      let start = ii;
+      while (start > 0 && !prob.items[start].pre) start--;
+      const it = prob.items[ii];
+      const given = (CHAINED.has(t.id) ? prob.items.slice(start, ii) : []).map((g) => ({ q: g.q, a: g.type === 'choice' ? g.ans : `${Keisu.fmt(g.ans, g.dec)} ${g.unit || ''}`.trim() }));
+      return {
+        kind: 'keisu', title: `問${i + 1}`, id: t.id, name: t.name, text: prob.text, rule: prob.rule, table: prob.table, given,
+        items: [Object.assign({}, it, { pre: prob.items[start].pre || '' })],
+      };
     });
   }
 
@@ -230,7 +240,7 @@
             <button class="btn" data-act="drill" data-subj="keisu" data-type="toyo">計数（登用形式）</button>
             <button class="btn" data-act="drill" data-subj="keisu" data-type="trainee">計数（トレーニー形式）</button>
           </div>
-          <p class="muted" style="margin-top:10px">1問（計数は1題）ずつ、その場で答え合わせをします。前に間違えた問題を優先して出します。</p>
+          <p class="muted" style="margin-top:10px">1問ずつ、その場で答え合わせをします。前に間違えた問題を優先して出します。</p>
         </section>
         <section class="card">
           <div class="row" style="margin-bottom:6px"><h2 class="grow" style="margin:0">受験履歴</h2>
@@ -266,10 +276,10 @@
     if (d.act === 'export') return exportHistory();
     if (d.act === 'import') return document.getElementById('importFile').click();
     if (d.act === 'drill') {
-      const subj = d.subj, unit = subj === 'keisu' ? '題' : '問';
+      const subj = d.subj, unit = '問';
       const missN = Object.values(load(MISS_KEY[subj], {})).filter((v) => v > 0).length;
       const title = subj === 'keisu' ? `計数（${d.type === 'trainee' ? 'トレーニー' : '登用'}形式）` : SUBJECTS[subj];
-      const how = { kiso: '空欄1つずつ4択で答えます。', yogo: '意味を見て用語を入力します。', keisu: '大問を1題ずつ解いて、答え合わせをします。' }[subj];
+      const how = { kiso: '空欄1つずつ4択で答えます。', yogo: '意味を見て用語を入力します。', keisu: '計算問題を1問ずつ解いて、答え合わせをします。' }[subj];
       openSheet(`<h3>${esc(title)}の練習</h3><p class="muted">${how}${missN ? `前に間違えた問題（${missN}）を優先して出します。` : ''}</p>
         <div class="choices">${DRILL_COUNTS[subj].map((n) => `<button class="btn primary" data-n="${n}">${n} ${unit}<span style="font-weight:400;font-size:13px">（約${Math.max(1, Math.round(n * DRILL_MIN[subj]))}分）</span></button>`).join('')}</div>
         <div style="margin-top:12px"><button class="btn ghost" data-close>やめる</button></div>`);
@@ -380,12 +390,12 @@
         foot = '<span></span><button class="btn primary" data-act="check">答え合わせ</button>';
       } else {
         const c = mine.filter((x) => isCorrect(x, exam.ans[x.key])).length;
-        body = `<div class="qhead"><h2>${esc(p.title)}　${esc(p.name || '')}</h2><span class="badge ${c === mine.length ? 'ok' : 'ng'}">${c} / ${mine.length} 正解</span></div>
+        body = `<div class="qhead"><h2>${esc(p.title)}　${esc(p.name || '')}</h2><span class="badge ${c === mine.length ? 'ok' : 'ng'}">${mine.length === 1 ? (c ? '正解' : '不正解') : `${c} / ${mine.length} 正解`}</span></div>
           <p class="qtext">${esc(p.text)}</p>${p.rule ? `<p class="rule">※${esc(p.rule)}</p>` : ''}${renderTable(p.table)}
           ${mine.map((x) => {
             const it = x.it, v = exam.ans[x.key], ok = isCorrect(x, v);
             const ans = it.type === 'choice' ? esc(it.ans) : `${esc(Keisu.fmt(it.ans, it.dec))} ${esc(it.unit || '')}${it.alt && it.alt.length ? `（${it.alt.map((a) => esc(Keisu.fmt(a, it.dec))).join('・')}も可）` : ''}`;
-            return `${it.pre ? `<div class="pre">${esc(it.pre)}</div>` : ''}<div class="item"><p class="q">${ok ? '<b style="color:var(--ok)">◯</b>' : '<b style="color:var(--ng)">✕</b>'} ${esc(it.q)}</p>
+            return `${it.pre ? `<div class="pre">${esc(it.pre)}</div>` : ''}${x.ii === 0 ? givenBox(p.given) : ''}<div class="item"><p class="q">${ok ?'<b style="color:var(--ok)">◯</b>' : '<b style="color:var(--ng)">✕</b>'} ${esc(it.q)}</p>
               <div class="ans">正解：<b>${ans}</b>　<span class="mine ${ok ? 'ok' : ''}">あなた：${answered(v) ? esc(v) : '（未回答）'}</span></div>
               <div class="exp" style="background:var(--bg);border-radius:8px;padding:8px 10px;margin-top:6px;font-size:13px;white-space:pre-wrap">${it.exp.map(esc).join('\n')}</div></div>`;
           }).join('')}`;
@@ -493,6 +503,12 @@
     }
   }
 
+  // 練習で1問だけ出すとき、前の小問とその答えを参考として表示
+  function givenBox(given) {
+    if (!given || !given.length) return '';
+    return `<div class="given"><div class="muted" style="font-size:12px;margin-bottom:2px">前の問いの答え（この問題で使います）</div>${given.map((g) => `<div>${esc(g.q)} → <b>${esc(g.a)}</b></div>`).join('')}</div>`;
+  }
+
   function renderTable(t) {
     if (!t) return '';
     const cell = (v) => { const s = String(v); const hole = /^[（(].*[）)]$|^[①-⑳]/.test(s); return `<td class="${hole ? 'hole' : ''}">${esc(s)}</td>`; };
@@ -511,14 +527,14 @@
     if (p.kind === 'keisu') {
       const items = p.items.map((it, ii) => {
         const key = `${si}-${pi}-${ii}`; const v = exam.ans[key];
-        const pre = it.pre ? `<div class="pre">${esc(it.pre)}</div>` : '';
+        const pre = (it.pre ? `<div class="pre">${esc(it.pre)}</div>` : '') + (ii === 0 ? givenBox(p.given) : '');
         const rule = it.rule ? `<p class="rule">※${esc(it.rule)}</p>` : '';
         if (it.type === 'choice') {
           return `${pre}<div class="item"><p class="q">${esc(it.q)}</p><div class="choices">${it.choices.map((c) => `<button class="choice ${v === c ? 'on' : ''}" data-act="choice" data-key="${key}" data-val="${esc(c)}">${esc(c)}</button>`).join('')}</div></div>`;
         }
         return `${pre}<div class="item"><p class="q">${esc(it.q)}</p>${rule}<div class="numin"><input type="text" inputmode="decimal" enterkeyhint="next" autocomplete="off" data-key="${key}" value="${esc(v || '')}" aria-label="${esc(it.q)}">${unitSpan(it.unit)}</div></div>`;
       }).join('');
-      return `<section class="card"><div class="qhead"><h2>${esc(p.title)}</h2><span class="muted">${p.items.length}問</span></div>
+      return `<section class="card"><div class="qhead"><h2>${esc(p.title)}</h2><span class="muted">${p.items.length > 1 ? `${p.items.length}問` : esc(p.name || '')}</span></div>
         <p class="qtext">${esc(p.text)}</p>${p.rule ? `<p class="rule">※${esc(p.rule)}</p>` : ''}${renderTable(p.table)}${items}</section>`;
     }
     const terms = p.terms.map((t, ti) => {
@@ -705,7 +721,7 @@
       }
       if (x.kind === 'keisu') {
         const it = x.it;
-        const ctx = it.pre ? `<p class="muted" style="white-space:pre-wrap;margin:0 0 4px">${esc(it.pre)}</p>` : '';
+        const ctx = (it.pre ? `<p class="muted" style="white-space:pre-wrap;margin:0 0 4px">${esc(it.pre)}</p>` : '') + (x.ii === 0 ? givenBox(x.p.given) : '');
         const ans = it.type === 'choice' ? esc(it.ans) : `${esc(Keisu.fmt(it.ans, it.dec))} ${esc(it.unit || '')}${it.alt && it.alt.length ? `（${it.alt.map((a) => esc(Keisu.fmt(a, it.dec))).join('・')}も可）` : ''}`;
         return `${head}<div class="rv">${ctx}<p class="q">${esc(it.q)}</p><div class="ans">正解：<b>${ans}</b></div>${mine(v, ok)}<div class="exp">${it.exp.map(esc).join('\n')}</div></div>`;
       }
