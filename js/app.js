@@ -1,0 +1,538 @@
+// 社内試験対策アプリ本体（保存は端末のブラウザ内 localStorage）
+(function () {
+  'use strict';
+
+  const APP_VERSION = '2026.09.15';
+  const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name' };
+  const SUBJECTS = { kiso: '基礎知識', keisu: '計数', yogo: '初歩用語' };
+  const EXAM_TYPES = { toyo: '登用試験', trainee: 'トレーニー試験' };
+  const LIMIT_MIN = 90;
+  const PASS = 70;
+  const YOGO_PER_PAGE = 10;
+  const FULL_HISTORY_KEEP = 15;
+
+  const $app = document.getElementById('app');
+  const $sheet = document.getElementById('sheet');
+  let BANK = null;
+  let exam = null; // 受験中データ
+  let ui = { view: 'home', subj: null, page: 0, reviewSubj: null, reviewAll: false, recordId: null };
+  let timerId = null;
+
+  // ---------- 汎用 ----------
+  const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  const shuffle = (arr) => { const a = arr.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; };
+  const circled = (n) => (n < 20 ? String.fromCharCode(0x2460 + n) : `(${n + 1})`);
+  const pad = (n) => String(n).padStart(2, '0');
+  const fmtDate = (ms) => { const d = new Date(ms); return `${d.getFullYear()}/${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+  const fmtDur = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); return `${Math.floor(s / 60)}分${pad(s % 60)}秒`; };
+  const load = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
+  const store = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } };
+  const remove = (k) => { try { localStorage.removeItem(k); } catch (e) { /* noop */ } };
+  const unitSpan = (u) => (u ? `<span class="unit">${esc(u)}</span>` : '<span class="unit"></span>');
+
+  function hash(str) { // FNV-1a 32bit
+    let h = 0x811c9dc5;
+    for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return (h >>> 0).toString(16).toUpperCase().padStart(8, '0');
+  }
+
+  // 用語の表記ゆれ吸収：全半角・大小文字・空白・記号・長音、ひらがな→カタカナ
+  function normTerm(s) {
+    return String(s || '').normalize('NFKC').toLowerCase()
+      .replace(/[ぁ-ゖ]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0x60))
+      .replace(/[\s・･.\-ー－―‐〜~「」『』【】"'’、。,，!！?？/／]/g, '');
+  }
+  function acceptList(t) {
+    const out = new Set();
+    [t.term].concat(t.accept || []).forEach((a) => {
+      out.add(normTerm(a));
+      const noParen = String(a).replace(/[（(][^）)]*[）)]/g, '');
+      if (noParen !== a) out.add(normTerm(noParen));
+      const m = String(a).match(/[（(]([^）)]*)[）)]/); if (m) out.add(normTerm(m[1]));
+    });
+    out.delete('');
+    return out;
+  }
+
+  // ---------- 問題作成 ----------
+  function buildSubject(key, type) {
+    if (key === 'kiso') {
+      return BANK.kiso.sections.filter((s) => s.core).map((s) => ({
+        kind: 'kiso', title: s.title, text: s.text,
+        blanks: s.blanks.map((b) => ({ answer: b.answer, choices: shuffle(b.choices) })),
+      }));
+    }
+    if (key === 'keisu') {
+      const probs = type === 'trainee' ? Keisu.makeTrainee() : Keisu.makeToyo();
+      return probs.map((p, i) => Object.assign({ kind: 'keisu', title: `問${i + 1}` }, p));
+    }
+    const n = BANK.yogo.terms.filter((t) => t.core).length;
+    const picked = shuffle(BANK.yogo.terms).slice(0, n);
+    const pages = [];
+    for (let i = 0; i < picked.length; i += YOGO_PER_PAGE) {
+      pages.push({ kind: 'yogo', title: `${i + 1}〜${Math.min(i + YOGO_PER_PAGE, picked.length)}`, terms: picked.slice(i, i + YOGO_PER_PAGE).map((t) => ({ id: t.id, meaning: t.meaning, hint: t.hint || '', term: t.term, accept: t.accept || [] })) });
+    }
+    return pages;
+  }
+
+  function newExam(type, mode, subjects) {
+    const now = Date.now();
+    const e = {
+      id: 'e' + now.toString(36) + Math.random().toString(36).slice(2, 6), app: APP_VERSION,
+      type, mode, name: (load(LS.name, '') || '').trim(), startedAt: now,
+      deadline: mode === 'honban' ? now + LIMIT_MIN * 60 * 1000 : null,
+      subjects: subjects.map((k) => ({ key: k, pages: buildSubject(k, type) })), ans: {},
+    };
+    return e;
+  }
+
+  // 小問の一覧（採点・進捗用）
+  function itemsOf(subj, si) {
+    const list = [];
+    subj.pages.forEach((p, pi) => {
+      if (p.kind === 'kiso') p.blanks.forEach((b, bi) => list.push({ key: `${si}-${pi}-${bi}`, pi, kind: 'kiso', p, b, bi }));
+      if (p.kind === 'keisu') p.items.forEach((it, ii) => list.push({ key: `${si}-${pi}-${ii}`, pi, kind: 'keisu', p, it, ii }));
+      if (p.kind === 'yogo') p.terms.forEach((t, ti) => list.push({ key: `${si}-${pi}-${ti}`, pi, kind: 'yogo', p, t, ti }));
+    });
+    return list;
+  }
+  const answered = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+
+  function isCorrect(x, v) {
+    if (!answered(v)) return false;
+    if (x.kind === 'kiso') return v === x.b.answer;
+    if (x.kind === 'keisu') return x.it.type === 'choice' ? v === x.it.ans : Keisu.checkNum(x.it, v);
+    return acceptList(x.t).has(normTerm(v));
+  }
+
+  function grade(e) {
+    const scores = {};
+    e.subjects.forEach((s, si) => {
+      const items = itemsOf(s, si);
+      const c = items.filter((x) => isCorrect(x, e.ans[x.key])).length;
+      scores[s.key] = { correct: c, total: items.length, score: items.length ? Math.floor(c / items.length * 100) : 0 };
+    });
+    const pass = e.subjects.every((s) => scores[s.key].score >= PASS);
+    return { scores, pass };
+  }
+
+  // ---------- 保存 ----------
+  let saveTimer = null;
+  function saveCurrent(now) {
+    if (!exam) return;
+    clearTimeout(saveTimer);
+    const run = () => { if (!store(LS.current, exam)) alert('端末の保存容量が不足しています。履歴を削除してください。'); };
+    if (now) run(); else saveTimer = setTimeout(run, 300);
+  }
+  document.addEventListener('visibilitychange', () => { if (document.hidden) saveCurrent(true); });
+
+  function pushHistory(rec) {
+    const hist = load(LS.history, []);
+    hist.unshift(rec);
+    hist.forEach((h, i) => { if (i >= FULL_HISTORY_KEEP) delete h.exam; });
+    while (hist.length && !store(LS.history, hist)) {
+      const idx = hist.map((h) => !!h.exam).lastIndexOf(true);
+      if (idx <= 0) { hist.pop(); } else { delete hist[idx].exam; }
+    }
+  }
+
+  // ---------- 画面切替 ----------
+  function go(view, extra) { Object.assign(ui, { view }, extra || {}); closeSheet(); render(); window.scrollTo(0, 0); }
+  function render() {
+    clearInterval(timerId);
+    if (ui.view === 'exam' && exam) return renderExam();
+    if (ui.view === 'result') return renderResult();
+    return renderHome();
+  }
+
+  // ================= ホーム =================
+  function renderHome() {
+    const name = load(LS.name, '');
+    const cur = load(LS.current, null);
+    const hist = load(LS.history, []);
+    const nKiso = BANK.kiso.sections.filter((s) => s.core).reduce((a, s) => a + s.blanks.length, 0);
+    const nYogo = BANK.yogo.terms.filter((t) => t.core).length;
+    $app.innerHTML = `
+      <header class="appbar"><h1>社内試験対策</h1><div class="sub">登用試験・トレーニー試験　3科目 ${LIMIT_MIN}分／各科目${PASS}点以上で合格</div></header>
+      <main class="wrap">
+        ${cur ? `<section class="card" style="border:2px solid var(--accent)">
+          <h2>受験の途中です</h2>
+          <p class="muted">${esc(EXAM_TYPES[cur.type])}・${cur.mode === 'honban' ? '本番モード' : '練習（' + cur.subjects.map((s) => SUBJECTS[s.key]).join('・') + '）'}　開始 ${fmtDate(cur.startedAt)}</p>
+          ${cur.deadline ? `<p class="muted">残り時間：${cur.deadline > Date.now() ? fmtDur(cur.deadline - Date.now()) : '時間切れ（再開すると採点します）'}</p>` : ''}
+          <div class="btn-grid"><button class="btn primary" data-act="resume">再開する</button><button class="btn danger" data-act="discard">破棄する</button></div>
+        </section>` : ''}
+        <section class="card">
+          <label class="lbl" for="name">氏名（結果画面に表示されます）</label>
+          <input id="name" type="text" autocomplete="name" placeholder="例：山田 太郎" value="${esc(name)}">
+        </section>
+        <section class="card">
+          <h2>本番モード（3科目・${LIMIT_MIN}分）</h2>
+          <div class="btn-grid">
+            <button class="btn primary exam-btn" data-act="start" data-type="toyo"><span class="t">登用試験</span><span class="d">基礎知識 ${nKiso}問／計数 63問／初歩用語 ${nYogo}問</span></button>
+            <button class="btn primary exam-btn" data-act="start" data-type="trainee"><span class="t">トレーニー試験</span><span class="d">基礎知識 ${nKiso}問／計数 大問4題／初歩用語 ${nYogo}問</span></button>
+          </div>
+          <p class="muted" style="margin-top:10px">計数の数値と初歩用語の出題語は毎回変わります。時間になると自動で提出されます。</p>
+        </section>
+        <section class="card">
+          <h2>科目別の練習（時間制限なし）</h2>
+          <div class="btn-grid">
+            <button class="btn" data-act="practice" data-subj="kiso" data-type="toyo">基礎知識</button>
+            <button class="btn" data-act="practice" data-subj="yogo" data-type="toyo">初歩用語</button>
+            <button class="btn" data-act="practice" data-subj="keisu" data-type="toyo">計数（登用形式）</button>
+            <button class="btn" data-act="practice" data-subj="keisu" data-type="trainee">計数（トレーニー形式）</button>
+          </div>
+        </section>
+        <section class="card">
+          <div class="row" style="margin-bottom:6px"><h2 class="grow" style="margin:0">受験履歴</h2>
+            <button class="btn small ghost" data-act="export">書き出し</button><button class="btn small ghost" data-act="import">読み込み</button></div>
+          ${hist.length ? `<ul class="hist">${hist.map((h) => histRow(h)).join('')}</ul>` : '<p class="muted">まだ履歴はありません。</p>'}
+          <input id="importFile" type="file" accept="application/json,.json" hidden>
+        </section>
+        <p class="foot">受験履歴はこのスマホのブラウザ内だけに保存されます（会社には送信されません）。<br>ブラウザのデータを消すと履歴も消えるので、必要に応じて「書き出し」で保存してください。<br>ホーム画面に追加するとアプリのように使えます。　ver ${APP_VERSION}</p>
+      </main>`;
+
+    const $name = document.getElementById('name');
+    $name.addEventListener('input', () => store(LS.name, $name.value));
+    $app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => homeAction(b.dataset)));
+    document.getElementById('importFile').addEventListener('change', importHistory);
+  }
+
+  function histRow(h) {
+    const r = h.result;
+    const label = h.mode === 'honban' ? `<span class="badge ${r.pass ? 'ok' : 'ng'}">${r.pass ? '合格' : '不合格'}</span>` : '<span class="badge pr">練習</span>';
+    const sc = Object.keys(r.scores).map((k) => `${SUBJECTS[k]} ${r.scores[k].score}`).join('　');
+    return `<li><button data-act="record" data-id="${esc(h.id)}">${label}<span class="grow"><b>${esc(EXAM_TYPES[h.type])}</b>　<span class="muted">${fmtDate(h.submittedAt)}</span><br><span class="muted">${esc(sc)}</span></span><span class="muted">›</span></button></li>`;
+  }
+
+  function homeAction(d) {
+    if (d.act === 'resume') { exam = load(LS.current, null); if (exam) enterExam(); return; }
+    if (d.act === 'discard') { if (confirm('途中の受験データを破棄します。よろしいですか？')) { remove(LS.current); render(); } return; }
+    if (d.act === 'record') { go('result', { recordId: d.id, reviewSubj: null, reviewAll: false }); return; }
+    if (d.act === 'export') return exportHistory();
+    if (d.act === 'import') return document.getElementById('importFile').click();
+    if (d.act === 'start' || d.act === 'practice') {
+      if (load(LS.current, null) && !confirm('途中の受験データがあります。破棄して新しく始めますか？')) return;
+      if (d.act === 'start') {
+        if (!(load(LS.name, '') || '').trim()) { alert('本番モードは氏名を入力してから始めてください。'); document.getElementById('name').focus(); return; }
+        if (!confirm(`${EXAM_TYPES[d.type]}（3科目・${LIMIT_MIN}分）を開始します。途中でアプリを閉じても時間は進みます。`)) return;
+        exam = newExam(d.type, 'honban', ['kiso', 'keisu', 'yogo']);
+      } else {
+        exam = newExam(d.type, 'practice', [d.subj]);
+      }
+      saveCurrent(true);
+      enterExam();
+    }
+  }
+
+  function exportHistory() {
+    const hist = load(LS.history, []);
+    if (!hist.length) { alert('書き出す履歴がありません。'); return; }
+    const blob = new Blob([JSON.stringify({ app: 'shiken-taisaku', version: APP_VERSION, exportedAt: Date.now(), history: hist })], { type: 'application/json' });
+    const a = document.createElement('a');
+    const d = new Date();
+    a.href = URL.createObjectURL(blob);
+    a.download = `試験対策_履歴_${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  }
+  function importHistory(ev) {
+    const file = ev.target.files && ev.target.files[0];
+    if (!file) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      try {
+        const data = JSON.parse(rd.result);
+        if (data.app !== 'shiken-taisaku' || !Array.isArray(data.history)) throw new Error('形式が違います');
+        const hist = load(LS.history, []);
+        const ids = new Set(hist.map((h) => h.id));
+        const add = data.history.filter((h) => h && h.id && h.result && !ids.has(h.id));
+        const merged = hist.concat(add).sort((a, b) => b.submittedAt - a.submittedAt);
+        merged.forEach((h, i) => { if (i >= FULL_HISTORY_KEEP) delete h.exam; });
+        store(LS.history, merged);
+        alert(`${add.length} 件の履歴を読み込みました。`);
+        render();
+      } catch (e) { alert('読み込めませんでした：' + e.message); }
+    };
+    rd.readAsText(file);
+  }
+
+  // ================= 受験 =================
+  function enterExam() {
+    if (exam.deadline && Date.now() >= exam.deadline) { submit(true); return; }
+    ui.subj = 0; ui.page = 0;
+    go('exam');
+  }
+
+  function subjProgress(si) {
+    const s = exam.subjects[si];
+    const items = itemsOf(s, si);
+    return { done: items.filter((x) => answered(exam.ans[x.key])).length, total: items.length };
+  }
+
+  function renderExam() {
+    const s = exam.subjects[ui.subj];
+    const page = s.pages[ui.page];
+    const pr = subjProgress(ui.subj);
+    const title = `${EXAM_TYPES[exam.type]}${exam.mode === 'honban' ? '' : '・練習'}`;
+    $app.innerHTML = `
+      <div class="exambar">
+        <div class="top">
+          <button class="btn small ghost" data-act="home" aria-label="ホームへ">‹ 中断</button>
+          <div class="grow" style="text-align:center"><div class="muted" style="line-height:1.2">${esc(title)}</div><div id="timer" class="timer">--:--</div></div>
+          <button class="btn small primary" data-act="nav">一覧・提出</button>
+        </div>
+        ${exam.subjects.length > 1 ? `<div class="tabs">${exam.subjects.map((x, i) => { const p = subjProgress(i); return `<button class="tab ${i === ui.subj ? 'on' : ''}" data-act="subj" data-i="${i}">${SUBJECTS[x.key]}<small>${p.done}/${p.total}</small></button>`; }).join('')}</div>` : ''}
+      </div>
+      <div class="progress"><i style="width:${pr.total ? pr.done / pr.total * 100 : 0}%"></i></div>
+      <main class="wrap" id="page">${renderPage(page, ui.subj, ui.page)}</main>
+      <nav class="pager">
+        <button class="btn" data-act="prev" ${ui.page === 0 ? 'disabled' : ''}>‹ 前へ</button>
+        <button class="mid" data-act="nav">${ui.page + 1} / ${s.pages.length}</button>
+        ${ui.page < s.pages.length - 1 ? '<button class="btn primary" data-act="next">次へ ›</button>'
+          : (ui.subj < exam.subjects.length - 1 ? `<button class="btn primary" data-act="nextsubj">${SUBJECTS[exam.subjects[ui.subj + 1].key]} ›</button>` : '<button class="btn primary" data-act="nav">提出へ</button>')}
+      </nav>`;
+    bindExam();
+    tick();
+    timerId = setInterval(tick, 1000);
+  }
+
+  function tick() {
+    const el = document.getElementById('timer');
+    if (!el || !exam) return;
+    if (exam.deadline) {
+      const left = exam.deadline - Date.now();
+      if (left <= 0) { clearInterval(timerId); saveCurrent(true); alert('試験時間が終了しました。自動で提出します。'); submit(true); return; }
+      const sec = Math.ceil(left / 1000);
+      el.textContent = `残り ${Math.floor(sec / 60)}:${pad(sec % 60)}`;
+      el.classList.toggle('low', sec <= 300);
+    } else {
+      const sec = Math.floor((Date.now() - exam.startedAt) / 1000);
+      el.textContent = `経過 ${Math.floor(sec / 60)}:${pad(sec % 60)}`;
+    }
+  }
+
+  function renderTable(t) {
+    if (!t) return '';
+    const cell = (v) => { const s = String(v); const hole = /^[（(].*[）)]$|^[①-⑳]/.test(s); return `<td class="${hole ? 'hole' : ''}">${esc(s)}</td>`; };
+    return `<div class="tbl-wrap"><table class="tbl"><thead><tr>${t.head.map((h) => `<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${t.rows.map((r) => `<tr>${r.map(cell).join('')}</tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function renderPage(p, si, pi) {
+    if (p.kind === 'kiso') {
+      const html = esc(p.text).replace(/\{\{(\d+)\}\}/g, (m, n) => {
+        const bi = Number(n); const v = exam.ans[`${si}-${pi}-${bi}`];
+        return `<button class="blank ${answered(v) ? 'filled' : ''}" data-act="blank" data-bi="${bi}"><span class="no">${circled(bi)}</span>${answered(v) ? esc(v) : '　　'}</button>`;
+      });
+      return `<section class="card"><div class="qhead"><h2>${esc(p.title)}</h2><span class="muted">空欄 ${p.blanks.length}</span></div>
+        <p class="muted" style="margin-top:-6px">空欄をタップして答えを選んでください。</p><div class="kiso-text">${html}</div></section>`;
+    }
+    if (p.kind === 'keisu') {
+      const items = p.items.map((it, ii) => {
+        const key = `${si}-${pi}-${ii}`; const v = exam.ans[key];
+        const pre = it.pre ? `<div class="pre">${esc(it.pre)}</div>` : '';
+        const rule = it.rule ? `<p class="rule">※${esc(it.rule)}</p>` : '';
+        if (it.type === 'choice') {
+          return `${pre}<div class="item"><p class="q">${esc(it.q)}</p><div class="choices">${it.choices.map((c) => `<button class="choice ${v === c ? 'on' : ''}" data-act="choice" data-key="${key}" data-val="${esc(c)}">${esc(c)}</button>`).join('')}</div></div>`;
+        }
+        return `${pre}<div class="item"><p class="q">${esc(it.q)}</p>${rule}<div class="numin"><input type="text" inputmode="decimal" enterkeyhint="next" autocomplete="off" data-key="${key}" value="${esc(v || '')}" aria-label="${esc(it.q)}">${unitSpan(it.unit)}</div></div>`;
+      }).join('');
+      return `<section class="card"><div class="qhead"><h2>${esc(p.title)}</h2><span class="muted">${p.items.length}問</span></div>
+        <p class="qtext">${esc(p.text)}</p>${p.rule ? `<p class="rule">※${esc(p.rule)}</p>` : ''}${renderTable(p.table)}${items}</section>`;
+    }
+    const terms = p.terms.map((t, ti) => {
+      const key = `${si}-${pi}-${ti}`;
+      return `<div class="yogo"><p class="m"><b>${esc(p.title.split('〜')[0] * 1 + ti)}.</b> ${esc(t.meaning)}</p>${t.hint ? `<div class="hint">ヒント：${esc(t.hint)}</div>` : ''}
+        <input type="text" enterkeyhint="next" autocomplete="off" autocapitalize="off" spellcheck="false" data-key="${key}" value="${esc(exam.ans[key] || '')}" placeholder="用語を入力" aria-label="用語"></div>`;
+    }).join('');
+    return `<section class="card"><div class="qhead"><h2>初歩用語 ${esc(p.title)}</h2></div><p class="muted" style="margin-top:-6px">意味にあてはまる用語を書きなさい。</p>${terms}</section>`;
+  }
+
+  function bindExam() {
+    $app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', (ev) => examAction(b.dataset, ev)));
+    const inputs = Array.from($app.querySelectorAll('input[data-key]'));
+    inputs.forEach((inp, idx) => {
+      inp.addEventListener('input', () => { exam.ans[inp.dataset.key] = inp.value; saveCurrent(); refreshTabs(); });
+      inp.addEventListener('keydown', (ev) => {
+        if (ev.key !== 'Enter' || ev.isComposing) return;
+        ev.preventDefault();
+        if (idx < inputs.length - 1) inputs[idx + 1].focus();
+        else inp.blur();
+      });
+    });
+  }
+
+  function refreshTabs() {
+    const pr = subjProgress(ui.subj);
+    const bar = $app.querySelector('.progress > i'); if (bar) bar.style.width = `${pr.total ? pr.done / pr.total * 100 : 0}%`;
+    const tabs = $app.querySelectorAll('.tab small');
+    tabs.forEach((el, i) => { const p = subjProgress(i); el.textContent = `${p.done}/${p.total}`; });
+  }
+
+  function examAction(d) {
+    const s = exam.subjects[ui.subj];
+    if (d.act === 'home') { saveCurrent(true); exam = null; go('home'); return; }
+    if (d.act === 'prev' && ui.page > 0) { ui.page--; go('exam'); return; }
+    if (d.act === 'next' && ui.page < s.pages.length - 1) { ui.page++; go('exam'); return; }
+    if (d.act === 'nextsubj') { ui.subj++; ui.page = 0; go('exam'); return; }
+    if (d.act === 'subj') { ui.subj = Number(d.i); ui.page = 0; go('exam'); return; }
+    if (d.act === 'nav') { openNav(); return; }
+    if (d.act === 'choice') {
+      exam.ans[d.key] = d.val; saveCurrent();
+      $app.querySelectorAll(`.choice[data-key="${d.key}"]`).forEach((c) => c.classList.toggle('on', c.dataset.val === d.val));
+      refreshTabs(); return;
+    }
+    if (d.act === 'blank') { openBlank(Number(d.bi)); }
+  }
+
+  // 穴埋めの選択シート
+  function openBlank(bi) {
+    const p = exam.subjects[ui.subj].pages[ui.page];
+    const b = p.blanks[bi];
+    const key = `${ui.subj}-${ui.page}-${bi}`;
+    const line = (p.text.split('\n').find((l) => l.includes(`{{${bi}}}`)) || '')
+      .replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === bi ? '【？】' : '＿'));
+    openSheet(`<h3>${circled(bi)} にあてはまる語句</h3><p class="muted" style="white-space:pre-wrap">${esc(line.trim())}</p>
+      <div class="choices">${b.choices.map((c) => `<button class="choice ${exam.ans[key] === c ? 'on' : ''}" data-val="${esc(c)}">${esc(c)}</button>`).join('')}</div>
+      <div class="btn-grid" style="margin-top:12px"><button class="btn ghost" data-close>閉じる</button><button class="btn ghost" data-clear>選択を消す</button></div>`);
+    $sheet.querySelectorAll('.choice').forEach((c) => c.addEventListener('click', () => {
+      exam.ans[key] = c.dataset.val; saveCurrent(); updateBlank(bi);
+      const next = p.blanks.findIndex((x, j) => j > bi && !answered(exam.ans[`${ui.subj}-${ui.page}-${j}`]));
+      if (next >= 0) openBlank(next); else closeSheet();
+    }));
+    $sheet.querySelector('[data-clear]').addEventListener('click', () => { delete exam.ans[key]; saveCurrent(); updateBlank(bi); closeSheet(); });
+  }
+  function updateBlank(bi) {
+    const el = $app.querySelector(`.blank[data-bi="${bi}"]`);
+    const v = exam.ans[`${ui.subj}-${ui.page}-${bi}`];
+    if (el) { el.classList.toggle('filled', answered(v)); el.innerHTML = `<span class="no">${circled(bi)}</span>${answered(v) ? esc(v) : '　　'}`; }
+    refreshTabs();
+  }
+
+  function openNav() {
+    const s = exam.subjects[ui.subj];
+    const items = itemsOf(s, ui.subj);
+    const grid = s.pages.map((p, pi) => {
+      const its = items.filter((x) => x.pi === pi);
+      const done = its.filter((x) => answered(exam.ans[x.key])).length;
+      const cls = done === its.length ? 'done' : done > 0 ? 'part' : '';
+      return `<button class="${cls} ${pi === ui.page ? 'cur' : ''}" data-pi="${pi}">${p.kind === 'yogo' ? pi * YOGO_PER_PAGE + 1 : pi + 1}</button>`;
+    }).join('');
+    const totals = exam.subjects.map((x, i) => { const p = subjProgress(i); return `${SUBJECTS[x.key]} ${p.done}/${p.total}`; }).join('　');
+    openSheet(`<h3>${SUBJECTS[s.key]}：ページ一覧</h3><p class="muted">塗りつぶし＝全問回答済み／黄枠＝一部回答</p>
+      <div class="navgrid">${grid}</div>
+      <p class="muted">回答状況：${esc(totals)}</p>
+      <div class="btn-grid"><button class="btn ghost" data-close>戻る</button><button class="btn primary" data-submit>提出して採点</button></div>`);
+    $sheet.querySelectorAll('[data-pi]').forEach((b) => b.addEventListener('click', () => { ui.page = Number(b.dataset.pi); go('exam'); }));
+    $sheet.querySelector('[data-submit]').addEventListener('click', () => {
+      const left = exam.subjects.reduce((a, x, i) => { const p = subjProgress(i); return a + (p.total - p.done); }, 0);
+      const msg = left ? `未回答が ${left} 問あります。提出してよろしいですか？` : '提出して採点します。よろしいですか？';
+      if (confirm(msg)) submit(false);
+    });
+  }
+
+  function openSheet(html) {
+    $sheet.innerHTML = `<div class="panel" role="dialog" aria-modal="true">${html}</div>`;
+    $sheet.hidden = false;
+    $sheet.querySelectorAll('[data-close]').forEach((b) => b.addEventListener('click', closeSheet));
+  }
+  function closeSheet() { $sheet.hidden = true; $sheet.innerHTML = ''; }
+  $sheet.addEventListener('click', (ev) => { if (ev.target === $sheet) closeSheet(); });
+
+  function submit(auto) {
+    clearInterval(timerId);
+    const now = exam.deadline ? Math.min(Date.now(), exam.deadline) : Date.now();
+    const result = grade(exam);
+    const name = exam.name || (load(LS.name, '') || '').trim();
+    const codeSrc = [exam.id, name, exam.type, exam.mode, now, JSON.stringify(result.scores)].join('|');
+    const rec = { id: exam.id, type: exam.type, mode: exam.mode, name, startedAt: exam.startedAt, submittedAt: now, auto: !!auto, result, code: hash(codeSrc), exam };
+    pushHistory(rec);
+    remove(LS.current);
+    exam = null;
+    go('result', { recordId: rec.id, reviewSubj: null, reviewAll: false });
+  }
+
+  // ================= 結果 =================
+  function renderResult() {
+    const hist = load(LS.history, []);
+    const h = hist.find((x) => x.id === ui.recordId);
+    if (!h) { go('home'); return; }
+    const r = h.result;
+    const keys = Object.keys(r.scores);
+    if (!ui.reviewSubj || !keys.includes(ui.reviewSubj)) ui.reviewSubj = keys[0];
+    const honban = h.mode === 'honban';
+    $app.innerHTML = `
+      <header class="appbar"><div class="row"><button class="btn small ghost" style="color:inherit;border-color:rgba(255,255,255,.4)" data-act="home">‹ ホーム</button><h1 class="grow" style="text-align:center">採点結果</h1><span style="width:70px"></span></div></header>
+      <main class="wrap">
+        <section class="verdict ${honban ? (r.pass ? 'ok' : 'ng') : 'ok'}">
+          <div class="muted" style="color:inherit">${esc(EXAM_TYPES[h.type])}　${honban ? '本番モード' : '練習'}</div>
+          <div class="big">${honban ? (r.pass ? '合　格' : '不合格') : '練習結果'}</div>
+          <div class="meta">${esc(h.name || '（氏名未入力）')}　${fmtDate(h.submittedAt)}　所要 ${fmtDur(h.submittedAt - h.startedAt)}${h.auto ? '（時間切れ提出）' : ''}</div>
+          <div class="meta">確認コード <span class="code">${esc(h.code)}</span></div>
+        </section>
+        <section class="card">
+          ${keys.map((k) => { const s = r.scores[k]; const ok = s.score >= PASS; return `<div class="score"><div class="lbl2"><span>${SUBJECTS[k]}</span><span style="color:var(--${ok ? 'ok' : 'ng'})">${s.score} 点</span></div>
+            <div class="bar"><i class="${ok ? 'ok' : 'ng'}" style="width:${s.score}%"></i><b></b></div><div class="muted">${s.correct} / ${s.total} 問正解　（合格ライン ${PASS} 点）</div></div>`; }).join('')}
+          ${honban ? `<p class="muted">3科目すべて ${PASS} 点以上で合格です。</p>` : ''}
+        </section>
+        <section class="card" id="review">${h.exam ? renderReview(h) : '<p class="muted">古い履歴のため、解答の詳細は保存されていません。</p>'}</section>
+        <div class="btn-grid"><button class="btn danger" data-act="delete">この履歴を削除</button><button class="btn primary" data-act="home">ホームへ</button></div>
+      </main>`;
+    $app.querySelectorAll('[data-act]').forEach((b) => b.addEventListener('click', () => {
+      const d = b.dataset;
+      if (d.act === 'home') go('home');
+      if (d.act === 'rsubj') { ui.reviewSubj = d.k; renderResult(); }
+      if (d.act === 'rall') { ui.reviewAll = d.v === '1'; renderResult(); }
+      if (d.act === 'delete' && confirm('この履歴を削除します。よろしいですか？')) { store(LS.history, hist.filter((x) => x.id !== h.id)); go('home'); }
+    }));
+  }
+
+  function renderReview(h) {
+    const e = h.exam;
+    const si = e.subjects.findIndex((s) => s.key === ui.reviewSubj);
+    const s = e.subjects[si];
+    const items = itemsOf(s, si);
+    const rows = items.map((x) => ({ x, v: e.ans[x.key], ok: isCorrect(x, e.ans[x.key]) })).filter((o) => ui.reviewAll || !o.ok);
+    const tabs = e.subjects.length > 1 ? `<div class="seg">${e.subjects.map((x) => `<button class="${x.key === ui.reviewSubj ? 'on' : ''}" data-act="rsubj" data-k="${x.key}">${SUBJECTS[x.key]}</button>`).join('')}</div>` : '';
+    const filt = `<div class="seg"><button class="${ui.reviewAll ? '' : 'on'}" data-act="rall" data-v="0">間違いのみ</button><button class="${ui.reviewAll ? 'on' : ''}" data-act="rall" data-v="1">すべて</button></div>`;
+    const mine = (v, ok) => `<div class="ans">あなたの答え：<span class="mine ${ok ? 'ok' : ''}">${answered(v) ? esc(v) : '（未回答）'}</span></div>`;
+    let lastPage = -1;
+    const body = rows.map(({ x, v, ok }) => {
+      let head = '';
+      if (x.pi !== lastPage) {
+        lastPage = x.pi;
+        if (x.kind !== 'yogo') head = `<h3 style="font-size:15px;margin:14px 0 4px">${esc(x.p.title)}${x.kind === 'keisu' && x.p.name ? '　' + esc(x.p.name) : ''}</h3>`;
+        if (x.kind === 'keisu') head += `<p class="muted" style="white-space:pre-wrap;margin:0 0 4px">${esc(x.p.text)}</p>${renderTable(x.p.table)}`;
+      }
+      if (x.kind === 'kiso') {
+        const line = (x.p.text.split('\n').find((l) => l.includes(`{{${x.bi}}}`)) || '').replace(/\{\{(\d+)\}\}/g, (m, n) => (Number(n) === x.bi ? '【　】' : x.p.blanks[Number(n)].answer));
+        return `${head}<div class="rv"><p class="q">${circled(x.bi)} ${esc(line.trim())}</p><div class="ans">正解：<b>${esc(x.b.answer)}</b></div>${mine(v, ok)}</div>`;
+      }
+      if (x.kind === 'keisu') {
+        const it = x.it;
+        const ctx = it.pre ? `<p class="muted" style="white-space:pre-wrap;margin:0 0 4px">${esc(it.pre)}</p>` : '';
+        const ans = it.type === 'choice' ? esc(it.ans) : `${esc(Keisu.fmt(it.ans, it.dec))} ${esc(it.unit || '')}${it.alt && it.alt.length ? `（${it.alt.map((a) => esc(Keisu.fmt(a, it.dec))).join('・')}も可）` : ''}`;
+        return `${head}<div class="rv">${ctx}<p class="q">${esc(it.q)}</p><div class="ans">正解：<b>${ans}</b></div>${mine(v, ok)}<div class="exp">${it.exp.map(esc).join('\n')}</div></div>`;
+      }
+      const t = x.t;
+      const others = (t.accept || []).filter((a) => normTerm(a) !== normTerm(t.term));
+      return `<div class="rv"><p class="q">${esc(t.meaning)}</p><div class="ans">正解：<b>${esc(t.term)}</b>${others.length ? `<span class="muted">（${others.map(esc).join('・')} も可）</span>` : ''}</div>${mine(v, ok)}</div>`;
+    }).join('');
+    return `<h2>解答の確認</h2>${tabs}${filt}${body || '<p class="muted">間違いはありません。</p>'}`;
+  }
+
+  // ---------- 起動 ----------
+  async function boot() {
+    try {
+      const [kiso, yogo] = await Promise.all(['data/kiso.json', 'data/yogo.json'].map((u) => fetch(u, { cache: 'no-cache' }).then((r) => { if (!r.ok) throw new Error(u); return r.json(); })));
+      BANK = { kiso, yogo };
+    } catch (e) {
+      $app.innerHTML = `<div class="wrap"><section class="card"><h2>問題データを読み込めませんでした</h2><p class="muted">電波の良い場所で再読み込みしてください。（${esc(e.message)}）</p></section></div>`;
+      return;
+    }
+    render();
+    if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+      navigator.serviceWorker.register('sw.js').catch(() => {});
+    }
+  }
+  boot();
+})();
