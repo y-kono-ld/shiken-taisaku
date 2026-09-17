@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  const APP_VERSION = '2026.09.15h';
+  const APP_VERSION = '2026.09.17';
   const LS = { current: 'shiken.v1.current', history: 'shiken.v1.history', name: 'shiken.v1.name', miss: 'shiken.v1.yogoMiss', missKiso: 'shiken.v1.kisoMiss', missKeisu: 'shiken.v1.keisuMiss' };
   // 練習1回の出題数と目安時間（分/問）
   const DRILL_COUNTS = { kiso: [10, 20, 30], yogo: [10, 20, 30], keisu: [5, 10, 15] };
@@ -12,6 +12,7 @@
   const LIMIT_MIN = 90;
   const PASS = 70;
   const YOGO_PER_PAGE = 10;
+  const YOGO_HONBAN = 100; // 本番の初歩用語の出題数（208語から毎回ランダム）
   const FULL_HISTORY_KEEP = 15;
 
   const $app = document.getElementById('app');
@@ -69,7 +70,7 @@
       const probs = type === 'trainee' ? Keisu.makeTrainee() : Keisu.makeToyo();
       return probs.map((p, i) => Object.assign({ kind: 'keisu', title: `問${i + 1}` }, p));
     }
-    const n = BANK.yogo.terms.filter((t) => t.core).length;
+    const n = Math.min(YOGO_HONBAN, BANK.yogo.terms.length);
     const picked = shuffle(BANK.yogo.terms).slice(0, n);
     const pages = [];
     for (let i = 0; i < picked.length; i += YOGO_PER_PAGE) {
@@ -231,7 +232,7 @@
     const cur = load(LS.current, null);
     const hist = load(LS.history, []);
     const nKiso = BANK.kiso.sections.filter((s) => s.core).reduce((a, s) => a + s.blanks.length, 0);
-    const nYogo = BANK.yogo.terms.filter((t) => t.core).length;
+    const nYogo = Math.min(YOGO_HONBAN, BANK.yogo.terms.length);
     $app.innerHTML = `
       <header class="appbar"><h1>社内試験対策</h1><div class="sub">登用試験・トレーニー試験　3科目 ${LIMIT_MIN}分／各科目${PASS}点以上で合格</div></header>
       <main class="wrap">
@@ -757,14 +758,18 @@
   // ---------- 起動 ----------
   async function boot() {
     try {
-      const [kiso, yogo] = await Promise.all(['data/kiso.json', 'data/yogo.json'].map((u) => fetch(u, { cache: 'no-cache' }).then((r) => { if (!r.ok) throw new Error(u); return r.json(); })));
-      BANK = { kiso, yogo };
+      if (window.SHIKEN_BANK) { // 1ファイル版：問題データはHTMLに埋め込み済み
+        BANK = window.SHIKEN_BANK;
+      } else {
+        const [kiso, yogo] = await Promise.all(['data/kiso.json', 'data/yogo.json'].map((u) => fetch(u, { cache: 'no-cache' }).then((r) => { if (!r.ok) throw new Error(u); return r.json(); })));
+        BANK = { kiso, yogo };
+      }
     } catch (e) {
       $app.innerHTML = `<div class="wrap"><section class="card"><h2>問題データを読み込めませんでした</h2><p class="muted">電波の良い場所で再読み込みしてください。（${esc(e.message)}）</p></section></div>`;
       return;
     }
     render();
-    if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
+    if (!window.SHIKEN_BANK && 'serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost' || location.hostname === '127.0.0.1')) {
       navigator.serviceWorker.register('sw.js').catch(() => {});
     }
   }
